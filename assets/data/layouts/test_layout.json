@@ -1,0 +1,428 @@
+{
+  "board": {
+    "w": 88,
+    "h": 80
+  },
+  "tiles": [
+    {
+      "tileId": 0,
+      "gx": 16,
+      "gy": 57,
+      "layer": 0
+    },
+    {
+      "tileId": 1,
+      "gx": 16,
+      "gy": 47,
+      "layer": 0
+    },
+    {
+      "tileId": 2,
+      "gx": 16,
+      "gy": 37,
+      "layer": 0
+    },
+    {
+      "tileId": 3,
+      "gx": 16,
+      "gy": 27,
+      "layer": 0
+    },
+    {
+      "tileId": 4,
+      "gx": 16,
+      "gy": 17,
+      "layer": 0
+    },
+    {
+      "tileId": 5,
+      "gx": 24,
+      "gy": 62,
+      "layer": 0
+    },
+    {
+      "tileId": 6,
+      "gx": 24,
+      "gy": 52,
+      "layer": 0
+    },
+    {
+      "tileId": 7,
+      "gx": 24,
+      "gy": 42,
+      "layer": 0
+    },
+    {
+      "tileId": 8,
+      "gx": 24,
+      "gy": 32,
+      "layer": 0
+    },
+    {
+      "tileId": 9,
+      "gx": 24,
+      "gy": 22,
+      "layer": 0
+    },
+    {
+      "tileId": 10,
+      "gx": 24,
+      "gy": 12,
+      "layer": 0
+    },
+    {
+      "tileId": 11,
+      "gx": 32,
+      "gy": 57,
+      "layer": 0
+    },
+    {
+      "tileId": 12,
+      "gx": 32,
+      "gy": 47,
+      "layer": 0
+    },
+    {
+      "tileId": 13,
+      "gx": 32,
+      "gy": 37,
+      "layer": 0
+    },
+    {
+      "tileId": 14,
+      "gx": 32,
+      "gy": 27,
+      "layer": 0
+    },
+    {
+      "tileId": 15,
+      "gx": 32,
+      "gy": 17,
+      "layer": 0
+    },
+    {
+      "tileId": 16,
+      "gx": 40,
+      "gy": 62,
+      "layer": 0
+    },
+    {
+      "tileId": 17,
+      "gx": 40,
+      "gy": 52,
+      "layer": 0
+    },
+    {
+      "tileId": 18,
+      "gx": 40,
+      "gy": 42,
+      "layer": 0
+    },
+    {
+      "tileId": 19,
+      "gx": 40,
+      "gy": 32,
+      "layer": 0
+    },
+    {
+      "tileId": 20,
+      "gx": 40,
+      "gy": 22,
+      "layer": 0
+    },
+    {
+      "tileId": 21,
+      "gx": 40,
+      "gy": 12,
+      "layer": 0
+    },
+    {
+      "tileId": 22,
+      "gx": 48,
+      "gy": 57,
+      "layer": 0
+    },
+    {
+      "tileId": 23,
+      "gx": 48,
+      "gy": 47,
+      "layer": 0
+    },
+    {
+      "tileId": 24,
+      "gx": 48,
+      "gy": 37,
+      "layer": 0
+    },
+    {
+      "tileId": 25,
+      "gx": 48,
+      "gy": 27,
+      "layer": 0
+    },
+    {
+      "tileId": 26,
+      "gx": 48,
+      "gy": 17,
+      "layer": 0
+    },
+    {
+      "tileId": 44,
+      "gx": 20,
+      "gy": 52,
+      "layer": 1
+    },
+    {
+      "tileId": 45,
+      "gx": 20,
+      "gy": 42,
+      "layer": 1
+    },
+    {
+      "tileId": 46,
+      "gx": 20,
+      "gy": 32,
+      "layer": 1
+    },
+    {
+      "tileId": 47,
+      "gx": 20,
+      "gy": 22,
+      "layer": 1
+    },
+    {
+      "tileId": 48,
+      "gx": 28,
+      "gy": 57,
+      "layer": 1
+    },
+    {
+      "tileId": 49,
+      "gx": 28,
+      "gy": 47,
+      "layer": 1
+    },
+    {
+      "tileId": 50,
+      "gx": 28,
+      "gy": 37,
+      "layer": 1
+    },
+    {
+      "tileId": 51,
+      "gx": 28,
+      "gy": 27,
+      "layer": 1
+    },
+    {
+      "tileId": 52,
+      "gx": 28,
+      "gy": 17,
+      "layer": 1
+    },
+    {
+      "tileId": 53,
+      "gx": 36,
+      "gy": 57,
+      "layer": 1
+    },
+    {
+      "tileId": 54,
+      "gx": 36,
+      "gy": 47,
+      "layer": 1
+    },
+    {
+      "tileId": 55,
+      "gx": 36,
+      "gy": 37,
+      "layer": 1
+    },
+    {
+      "tileId": 56,
+      "gx": 36,
+      "gy": 27,
+      "layer": 1
+    },
+    {
+      "tileId": 57,
+      "gx": 36,
+      "gy": 17,
+      "layer": 1
+    },
+    {
+      "tileId": 58,
+      "gx": 44,
+      "gy": 52,
+      "layer": 1
+    },
+    {
+      "tileId": 59,
+      "gx": 44,
+      "gy": 42,
+      "layer": 1
+    },
+    {
+      "tileId": 60,
+      "gx": 44,
+      "gy": 32,
+      "layer": 1
+    },
+    {
+      "tileId": 61,
+      "gx": 44,
+      "gy": 22,
+      "layer": 1
+    },
+    {
+      "tileId": 62,
+      "gx": 24,
+      "gy": 47,
+      "layer": 2
+    },
+    {
+      "tileId": 63,
+      "gx": 16,
+      "gy": 47,
+      "layer": 2
+    },
+    {
+      "tileId": 64,
+      "gx": 32,
+      "gy": 47,
+      "layer": 2
+    },
+    {
+      "tileId": 65,
+      "gx": 40,
+      "gy": 47,
+      "layer": 2
+    },
+    {
+      "tileId": 66,
+      "gx": 48,
+      "gy": 47,
+      "layer": 2
+    },
+    {
+      "tileId": 67,
+      "gx": 16,
+      "gy": 27,
+      "layer": 2
+    },
+    {
+      "tileId": 68,
+      "gx": 24,
+      "gy": 27,
+      "layer": 2
+    },
+    {
+      "tileId": 69,
+      "gx": 32,
+      "gy": 27,
+      "layer": 2
+    },
+    {
+      "tileId": 70,
+      "gx": 40,
+      "gy": 27,
+      "layer": 2
+    },
+    {
+      "tileId": 71,
+      "gx": 48,
+      "gy": 27,
+      "layer": 2
+    },
+    {
+      "tileId": 72,
+      "gx": 20,
+      "gy": 37,
+      "layer": 2
+    },
+    {
+      "tileId": 73,
+      "gx": 44,
+      "gy": 37,
+      "layer": 2
+    },
+    {
+      "tileId": 74,
+      "gx": 32,
+      "gy": 37,
+      "layer": 2
+    },
+    {
+      "tileId": 75,
+      "gx": 28,
+      "gy": 52,
+      "layer": 3
+    },
+    {
+      "tileId": 76,
+      "gx": 36,
+      "gy": 52,
+      "layer": 3
+    },
+    {
+      "tileId": 77,
+      "gx": 24,
+      "gy": 42,
+      "layer": 3
+    },
+    {
+      "tileId": 78,
+      "gx": 32,
+      "gy": 42,
+      "layer": 3
+    },
+    {
+      "tileId": 79,
+      "gx": 40,
+      "gy": 42,
+      "layer": 3
+    },
+    {
+      "tileId": 80,
+      "gx": 28,
+      "gy": 32,
+      "layer": 3
+    },
+    {
+      "tileId": 81,
+      "gx": 36,
+      "gy": 32,
+      "layer": 3
+    },
+    {
+      "tileId": 82,
+      "gx": 28,
+      "gy": 47,
+      "layer": 4
+    },
+    {
+      "tileId": 83,
+      "gx": 36,
+      "gy": 47,
+      "layer": 4
+    },
+    {
+      "tileId": 84,
+      "gx": 28,
+      "gy": 37,
+      "layer": 4
+    },
+    {
+      "tileId": 85,
+      "gx": 36,
+      "gy": 37,
+      "layer": 4
+    },
+    {
+      "tileId": 86,
+      "gx": 32,
+      "gy": 42,
+      "layer": 5
+    }
+  ]
+}

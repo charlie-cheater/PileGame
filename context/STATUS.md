@@ -1,0 +1,53 @@
+# 项目状态快照
+
+> **会话入口文档**。进入会话先读此文件,离开会话务必同步更新。
+> 最后更新:2026-11-21(关卡生成方向确立与背景归档)
+
+## 基本信息
+
+- **项目**:PileDisassembleGame(Cocos Creator 3.8.7 · 2D 方案,工程细节见 [background/cocos-facts.md](background/cocos-facts.md))
+- **游戏名**:❓待定(《对子乐消消》为**参考原作**名,仅作代号)
+- **平台**:微信小游戏;竖屏 750×1624(设计分辨率已写入工程)
+- **设计北极星**:情绪锚点 → [map/nodes/emotional-anchor.md](map/nodes/emotional-anchor.md)
+- **设计现状总览(认知地图)**:[map/MAP.md](map/MAP.md)
+- **Git**:master,首提交 `3f82e8a`(基础架构里程碑,76 文件)
+
+## 当前阶段:P3 · 关卡生成算法设计 —— 方向已确立 ✅,算法设计由用户提供中
+
+## 已完成(P3)
+
+- [x] **设计方向确认**(2026-11-21):求解器定位为**仿真玩家代理 × 渐进式规划器**(EDPCG 脉络),否定传统验证性求解器为目标;现阶段配对形态锁定**全图匹配(FULL)**,元素重复度成为内容主轴 → [map/nodes/level-generation.md](map/nodes/level-generation.md)
+- [x] **背景研究归档**:可解性/验证算法(NP-completeness 谱系、P1/P2/P3 结构性质、de Bondt 技术阶梯、性能注意)→ [background/solvability-research.md](background/solvability-research.md);玩家仿真代理学术脉络与设计素材 → [background/player-model-research.md](background/player-model-research.md)
+
+## 已完成(P2)
+
+- [x] **core 逻辑层**:`tile.ts` 数据契约(unit 整数制/非对称遮挡 v2.1)、`Occlusion`、`Board` 状态机、`LevelBuilder`(金字塔生成,I1~I5 自检;64/64 场景测试)
+- [x] **表现层**:`MahjongTileArt`(双面材质/厚度/投影/转面描边,Inspector 参数化)、`TilePrints` **34 种麻将印花**(饼/条 Graphics + 万/风/箭 Label 楷体)、`PileView`(绘制序/贝塞尔飞入/吸引爆闪/槽位滑移)、`TrayView` 木托盘
+- [x] **控制层**:`GameController`(初始化 → 点击 → 飞入 → 配对 → 紧凑 → 胜负遮罩 → 重开;动画回调链 + 输入锁)
+- [x] 测试关卡:5×5×4 金字塔,54 张,27 种牌型 × 1 对(全图对 = FULL 形态)
+- [x] 首次 git 提交(`.gitignore` 排除编辑器缓存/本地扩展/MCP 运行时)
+
+## 待办(下一步)
+
+- [ ] **关卡生成算法设计落地**:用户提供代理行为规则 + 规划器算法 → 实现(P3 主线)
+- [ ] LevelBuilder 增 FULL 模式(第 6 步现硬编码 L/R 分配);可玩关卡底层数据统一为 FULL
+- [ ] 奖励动画 v2:开盒/玩具弹出(reward-loop 完整版,当前为吸引+爆闪 v1)
+- [ ] 道具三件套 UI(撤回/洗牌/提示;Board API 已就绪)
+- [ ] HUD(第N关 / 脑力 / 暂停)
+- [ ] **音效:鸟鸣环境音**(情绪锚点的听觉通道,尚未启动)
+- [ ] 二分半图印花管线(正式素材/程序切半;数据层 L/R 已就绪,启用时机待关卡生成定稿)
+
+## 未决事项
+
+| # | 问题 | 状态 |
+|---|---|---|
+| 1 | 游戏正式名称 | ❓未定 |
+| 2 | 「脑力」资源含义(toy-economy) | ❓未定 |
+| 3 | 排行榜实现(微信好友榜/服务端) | ❓未定 |
+| 4 | 视觉载体演化:盲盒方案已搁置,现用真实麻将牌面;未来是否回归盲盒/玩具 IP 包装 | 🟡 实践决策,待产品层面复盘 |
+| 5 | 素材管线:AI 生成(工具/prompt 已备)+ 程序切半 | 🟡 用户推进中 |
+| 6 | 元素重复度参数化(每元素 2/4/6 张)与难度曲线目标形态 | 🟡 待关卡生成算法设计 |
+
+## 阻塞
+
+无

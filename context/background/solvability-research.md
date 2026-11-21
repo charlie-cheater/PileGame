@@ -1,0 +1,59 @@
+# 可解性与验证算法研究(关卡生成背景)
+
+> 背景知识:配对移除类游戏的可解性复杂度、验证性求解器技术与本作结构性质推导。2026-11-21 会话归档;代码侧分析工具见 `assets/scripts/core/`(Depth / OcclusionTopology / Visibility / Statics / LayoutGen),本文件存代码里看不出来的研究结论。
+> 定位注记:验证性求解器已**降级为安全网**(2026-11-21 设计确认)——正确性由构造保证,体验评估交由仿真玩家代理,见 [map/nodes/level-generation.md](../map/nodes/level-generation.md)。
+
+## 复杂度谱系(为什么必须启发式)
+
+| 结论 | 出处 |
+|---|---|
+| Mahjong Solitaire(无偷看)最优游玩 PSPACE-complete | Condon, Feigenbaum, Lund, Shor 1997 |
+| 允许偷看(全可见)可解性判定 NP-complete | Eppstein |
+| 仅高 3 孤立堆(aab / abb 两型)仍 NP-complete(3-SAT 归约) | de Bondt 2012(arXiv:1203.6559) |
+| 单层平铺(无堆叠)也 NP-complete(堆→行变换) | 同上,推论 |
+
+对本作的启示:本作全可见,与"偷看版"同族;**难度瓶颈在"配对分配 × 埋放结构"的耦合**,限制堆高甚至平铺都换不回多项式时间 → 捷径在剪枝/启发式,或由构造直接保证可解。
+
+## 验证的不对称性
+
+- **证可解便宜**:给出见证序列,重放校验 O(n)
+- **证不可解昂贵**:需穷尽指数级状态空间
+- 工业实践 → **单侧验证器**:找到解 = 确定可解;限时找不到 = 不判定,丢弃重生
+
+## 本作结构性质(P1/P2/P3,由 Occlusion 判定语义推导)
+
+- **P1 单调性**:牌的阻塞者全部是 z 更高的 pile 牌;移除只会减少阻塞者 → 已可点牌永远可点,可点集随移除单调扩张
+- **P2 双亮对折叠引理**:两张当前可点的可配对牌(全图匹配下 = 同元素两张),在开对数 ≤ 2 时立即成对移除**永不会把可解局变不可解**(任何解都可重排为以此对开头)→ 验证器/规划器可贪心折叠"双亮对"至不动点
+- **P3 状态归约**:槽内容可由已移除集 R 导出(一对恰有一半在 R = 开着)→ 模拟/搜索状态 = R 位集;容量约束 = 任意时刻开对 ≤ 3(第 4 张必须闭对)
+- **推论**:`OcclusionTopology.directBlockers[t]` 即静态阻塞表,clickable(t) ⇔ directBlockers[t] ⊆ R → 轻量影子状态搜索器单节点近 O(1);勿驱动 Board(Board 无任意回退,recall 仅栈顶)
+- **等价改述**:带前序约束(遮挡 DAG)与资源容量(3 开对)的**对调度问题**——与 NP-complete 结论相容
+
+## de Bondt 求解器技术阶梯(arXiv:1203.6559 §3)
+
+其游戏模型(36 组 × 每组 4 张、组内可互换)与本作"全图匹配 + 每元素 4 张"**几乎直接对口**:
+
+1. 朴素回溯 → 过慢
+2. **Cleaning 清扫折叠**(能整组移除的立即移除)↔ 本作 P2
+3. **交换律规范化**(强制按组序升序,砍掉排列冗余)↔ 本作"状态 = R 位集"记忆化
+4. **按组配对分支**(每组 4 张仅 3 种配对方案,树 3³⁶;组间次序任意、不实际移牌)
+5. **Pruning scan 松弛扫描**:放宽规则做多项式扫描,松弛版失败 ⇒ 原问题必无解(必要条件快筛 / 松弛证书)
+6. **Critical groups 关键组优先**:优先分支"松弛扫描中允许配对方式最少"的组(最受限变量优先)+ 自适应反向剥离启发式
+7. **Random solving**:随机选对约 708 次(1.236³⁶)配合折叠;Ken McDonald 用通关成功率作难度度量(随机 playout 难度度量的出处)
+8. 性能:典型盘面 < 1s,最坏 ~1min(此前同类算法:咖啡时间 ~ 一天)
+
+**堵环(blocked cycle)**:多项式可查的结构性死锁证书——2 张组循环互埋 ⇒ 必无解。本作可发明"**槽死锁模式**"对应物(迫使同时开对 > 3 的结构)。
+
+**布局形态 → 无解率实证**(随机发牌统计):龟壳 2.95%、剧场 0.62%、桥 32%、公牛 47%、沙漏/蝴蝶 100% → **骨架形状直接决定随机配对下的可解基率**,骨架与配对分配应联动设计。
+
+## 工程注意(性能)
+
+- 代码注释按 **n ≤ ~60** 设计(O(n²) 穷举、无空间索引);一次性分析到 300 张仍毫秒级,**热循环**(求解器反复调用分析函数)才是真实风险
+- 隐蔽点:`Visibility.unionArea` 最坏 ~O(n⁴)(全量 computeVisibleState),且 `Board.refresh()` 无条件计算;`OcclusionTopology.zOf` 用线性 `find` 嵌在闭包排序比较器里
+- 上探优化次序:unionArea 扫描线 / 调试开启才算 → zOf 改 Map 索引 → 遮挡按层分桶;增量更新待算法定稿后按调用频度决定
+- 硬上限:`countExposePaths` 闭包 > 20 拒绝精确计数;`enumerateExposePaths` 截断 16 条
+
+## 参考
+
+- [Solving Mahjong Solitaire boards with peeking — de Bondt, arXiv:1203.6559](https://arxiv.org/pdf/1203.6559)
+- [Mahjong solitaire — Wikipedia(复杂度条目)](https://en.wikipedia.org/wiki/Mahjong_solitaire)
+- Eppstein "Computational Complexity of Games and Puzzles" 页(定理 2 出处)

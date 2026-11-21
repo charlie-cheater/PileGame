@@ -1,0 +1,418 @@
+{
+  "board": {
+    "w": 40,
+    "h": 52
+  },
+  "elements": [
+    {
+      "elementId": "marble",
+      "displayName": "玻璃弹珠",
+      "color": "#F5E9CF"
+    },
+    {
+      "elementId": "top",
+      "displayName": "陀螺",
+      "color": "#BFE3F2"
+    },
+    {
+      "elementId": "windfrog",
+      "displayName": "发条青蛙",
+      "color": "#CDE8C2"
+    },
+    {
+      "elementId": "squirtgun",
+      "displayName": "水枪",
+      "color": "#E4D6F0"
+    },
+    {
+      "elementId": "yoyo",
+      "displayName": "悠悠球",
+      "color": "#F6D8C8"
+    },
+    {
+      "elementId": "pinwheel",
+      "displayName": "纸风车",
+      "color": "#F4CBD6"
+    }
+  ],
+  "tiles": [
+    {
+      "elementId": "windfrog",
+      "variant": "L",
+      "gx": 0,
+      "gy": 2,
+      "layer": 0
+    },
+    {
+      "elementId": "windfrog",
+      "variant": "R",
+      "gx": 8,
+      "gy": 2,
+      "layer": 0
+    },
+    {
+      "elementId": "yoyo",
+      "variant": "R",
+      "gx": 16,
+      "gy": 2,
+      "layer": 0
+    },
+    {
+      "elementId": "marble",
+      "variant": "R",
+      "gx": 24,
+      "gy": 2,
+      "layer": 0
+    },
+    {
+      "elementId": "squirtgun",
+      "variant": "L",
+      "gx": 32,
+      "gy": 2,
+      "layer": 0
+    },
+    {
+      "elementId": "squirtgun",
+      "variant": "L",
+      "gx": 0,
+      "gy": 12,
+      "layer": 0
+    },
+    {
+      "elementId": "yoyo",
+      "variant": "L",
+      "gx": 8,
+      "gy": 12,
+      "layer": 0
+    },
+    {
+      "elementId": "squirtgun",
+      "variant": "L",
+      "gx": 16,
+      "gy": 12,
+      "layer": 0
+    },
+    {
+      "elementId": "top",
+      "variant": "L",
+      "gx": 24,
+      "gy": 12,
+      "layer": 0
+    },
+    {
+      "elementId": "pinwheel",
+      "variant": "L",
+      "gx": 32,
+      "gy": 12,
+      "layer": 0
+    },
+    {
+      "elementId": "marble",
+      "variant": "R",
+      "gx": 0,
+      "gy": 22,
+      "layer": 0
+    },
+    {
+      "elementId": "marble",
+      "variant": "L",
+      "gx": 8,
+      "gy": 22,
+      "layer": 0
+    },
+    {
+      "elementId": "top",
+      "variant": "R",
+      "gx": 16,
+      "gy": 22,
+      "layer": 0
+    },
+    {
+      "elementId": "windfrog",
+      "variant": "R",
+      "gx": 24,
+      "gy": 22,
+      "layer": 0
+    },
+    {
+      "elementId": "yoyo",
+      "variant": "L",
+      "gx": 32,
+      "gy": 22,
+      "layer": 0
+    },
+    {
+      "elementId": "yoyo",
+      "variant": "R",
+      "gx": 0,
+      "gy": 32,
+      "layer": 0
+    },
+    {
+      "elementId": "squirtgun",
+      "variant": "R",
+      "gx": 8,
+      "gy": 32,
+      "layer": 0
+    },
+    {
+      "elementId": "top",
+      "variant": "R",
+      "gx": 16,
+      "gy": 32,
+      "layer": 0
+    },
+    {
+      "elementId": "marble",
+      "variant": "R",
+      "gx": 24,
+      "gy": 32,
+      "layer": 0
+    },
+    {
+      "elementId": "pinwheel",
+      "variant": "L",
+      "gx": 32,
+      "gy": 32,
+      "layer": 0
+    },
+    {
+      "elementId": "marble",
+      "variant": "L",
+      "gx": 0,
+      "gy": 42,
+      "layer": 0
+    },
+    {
+      "elementId": "pinwheel",
+      "variant": "R",
+      "gx": 8,
+      "gy": 42,
+      "layer": 0
+    },
+    {
+      "elementId": "squirtgun",
+      "variant": "L",
+      "gx": 16,
+      "gy": 42,
+      "layer": 0
+    },
+    {
+      "elementId": "yoyo",
+      "variant": "L",
+      "gx": 24,
+      "gy": 42,
+      "layer": 0
+    },
+    {
+      "elementId": "marble",
+      "variant": "L",
+      "gx": 32,
+      "gy": 42,
+      "layer": 0
+    },
+    {
+      "elementId": "marble",
+      "variant": "L",
+      "gx": 4,
+      "gy": 8,
+      "layer": 1
+    },
+    {
+      "elementId": "windfrog",
+      "variant": "L",
+      "gx": 12,
+      "gy": 8,
+      "layer": 1
+    },
+    {
+      "elementId": "pinwheel",
+      "variant": "R",
+      "gx": 20,
+      "gy": 8,
+      "layer": 1
+    },
+    {
+      "elementId": "windfrog",
+      "variant": "R",
+      "gx": 28,
+      "gy": 8,
+      "layer": 1
+    },
+    {
+      "elementId": "marble",
+      "variant": "R",
+      "gx": 4,
+      "gy": 18,
+      "layer": 1
+    },
+    {
+      "elementId": "windfrog",
+      "variant": "L",
+      "gx": 12,
+      "gy": 18,
+      "layer": 1
+    },
+    {
+      "elementId": "top",
+      "variant": "L",
+      "gx": 20,
+      "gy": 18,
+      "layer": 1
+    },
+    {
+      "elementId": "windfrog",
+      "variant": "R",
+      "gx": 28,
+      "gy": 18,
+      "layer": 1
+    },
+    {
+      "elementId": "pinwheel",
+      "variant": "L",
+      "gx": 4,
+      "gy": 28,
+      "layer": 1
+    },
+    {
+      "elementId": "marble",
+      "variant": "R",
+      "gx": 12,
+      "gy": 28,
+      "layer": 1
+    },
+    {
+      "elementId": "yoyo",
+      "variant": "L",
+      "gx": 20,
+      "gy": 28,
+      "layer": 1
+    },
+    {
+      "elementId": "yoyo",
+      "variant": "R",
+      "gx": 28,
+      "gy": 28,
+      "layer": 1
+    },
+    {
+      "elementId": "windfrog",
+      "variant": "R",
+      "gx": 4,
+      "gy": 38,
+      "layer": 1
+    },
+    {
+      "elementId": "yoyo",
+      "variant": "R",
+      "gx": 12,
+      "gy": 38,
+      "layer": 1
+    },
+    {
+      "elementId": "top",
+      "variant": "R",
+      "gx": 20,
+      "gy": 38,
+      "layer": 1
+    },
+    {
+      "elementId": "squirtgun",
+      "variant": "R",
+      "gx": 28,
+      "gy": 38,
+      "layer": 1
+    },
+    {
+      "elementId": "top",
+      "variant": "R",
+      "gx": 8,
+      "gy": 14,
+      "layer": 2
+    },
+    {
+      "elementId": "top",
+      "variant": "L",
+      "gx": 16,
+      "gy": 14,
+      "layer": 2
+    },
+    {
+      "elementId": "top",
+      "variant": "R",
+      "gx": 24,
+      "gy": 14,
+      "layer": 2
+    },
+    {
+      "elementId": "pinwheel",
+      "variant": "R",
+      "gx": 8,
+      "gy": 24,
+      "layer": 2
+    },
+    {
+      "elementId": "windfrog",
+      "variant": "L",
+      "gx": 16,
+      "gy": 24,
+      "layer": 2
+    },
+    {
+      "elementId": "pinwheel",
+      "variant": "L",
+      "gx": 24,
+      "gy": 24,
+      "layer": 2
+    },
+    {
+      "elementId": "top",
+      "variant": "L",
+      "gx": 8,
+      "gy": 34,
+      "layer": 2
+    },
+    {
+      "elementId": "pinwheel",
+      "variant": "R",
+      "gx": 16,
+      "gy": 34,
+      "layer": 2
+    },
+    {
+      "elementId": "windfrog",
+      "variant": "L",
+      "gx": 24,
+      "gy": 34,
+      "layer": 2
+    },
+    {
+      "elementId": "squirtgun",
+      "variant": "R",
+      "gx": 12,
+      "gy": 20,
+      "layer": 3
+    },
+    {
+      "elementId": "marble",
+      "variant": "L",
+      "gx": 20,
+      "gy": 20,
+      "layer": 3
+    },
+    {
+      "elementId": "top",
+      "variant": "L",
+      "gx": 12,
+      "gy": 30,
+      "layer": 3
+    },
+    {
+      "elementId": "squirtgun",
+      "variant": "R",
+      "gx": 20,
+      "gy": 30,
+      "layer": 3
+    }
+  ]
+}

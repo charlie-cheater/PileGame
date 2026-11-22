@@ -10,13 +10,13 @@
 //     整格位置 + 支撑判定自然涌现
 //
 // 算法:每层在合法格点集内随机采样(蒙版过滤 + 支撑约束:必须压住至少一张
-// k-1 层牌,复用 blocksOcclusion);层量显式 layerCounts 优先,缺省按衰减率分配。
+// k-1 层牌,复用 pressesOn 实质压迫谓词);层量显式 layerCounts 优先,缺省按衰减率分配。
 // 失败策略(C6):撒不满/初始可点不足 → 换派生 seed 整体重试(≤5 次)。
 // 输出 slots 自带 tileId(= 生成序);自检 C1(半格格点)/C2/C3/C5。
 // ============================================================================
 
 import { TILE, Unit } from './tile';
-import { OcclusionSubject, blocksOcclusion, faceRectOf, overlapArea } from './Occlusion';
+import { OcclusionSubject, pressesOn, faceRectOf, overlapArea } from './Occlusion';
 import { computeDepths } from './Depth';
 import { lcg, fisherYates } from './LevelBuilder';
 import { checkTorque, ContactRect, rectIntersect } from './Statics';
@@ -150,7 +150,9 @@ function tryGenerate(cfg: RandomLayoutConfig, rng: () => number, maskShrink = 1)
       }
       if (k > 0) {
         const cand: OcclusionSubject = { tileId: -1, gx, gy, layer: k };
-        if (!tiles[k - 1].some(t => blocksOcclusion(cand, t))) return false;
+        // 支撑 = 实质压迫(pressesOn,v2.2 级单对语义;blocked 的 v3 并集
+        // 口径不适用于"压在哪张上"的单对判定)
+        if (!tiles[k - 1].some(t => pressesOn(cand, t))) return false;
         // 力矩平衡:与紧邻下层的接触矩形 → 支撑凸包 + 刀刃面积门槛
         if (cfg.torque !== false) {
           const contacts: ContactRect[] = [];
@@ -265,7 +267,7 @@ function assertInvariants(cfg: RandomLayoutConfig, slots: OcclusionSubject[]): v
     }
     if (s.layer > 0) {
       const supported = slots.some(t =>
-        t.layer === s.layer - 1 && blocksOcclusion(s, t));
+        t.layer === s.layer - 1 && pressesOn(s, t));
       if (!supported) throw new Error(`C3: 层 ${s.layer} 牌(${s.gx},${s.gy})悬空`);
     }
   }

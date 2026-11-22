@@ -1,19 +1,22 @@
 // ============================================================================
 // Visibility.ts — 当前可见牌状态(版面"最外层"暴露数据,2026-11-20 设计确认)
 //
-// 定义:牌 t 的顶面处于 t.layer 的 z 高度;所有 z 更高的 pile 牌的视觉体投影
-// (顶面∪侧面,即 totalRect)与 face(t) 的交集构成 t 的覆盖并集。
+// 定义:牌 t 的顶面处于 t.layer 的 z 高度;所有 z 更高 pile 牌的覆盖贡献
+// (跨层 = 顶面∪侧面 totalRect;同层 = 顶面 faceRect,subZ 布局的 前排盖后排;
+// 2026-11-22 v3 统一口径,与 Occlusion.coverRectOf 单一事实源)与 face(t)
+// 的交集构成 t 的覆盖并集。
 //   exposedArea(t) = area(face(t)) − area(覆盖并集)
 //   "至少有部分正面暴露在最外层" ⇔ exposedArea > 0(整数几何,精确无浮点)
 //
-// 与遮挡阈值判定(blacked,∃ 单一遮挡者 > 18%)正交:
-//   · blocked 且部分暴露(20% 被盖 → 80% 暴露)✅ 常见
-//   · 多个小面积遮挡累加盖满(每个 ≤18%,不 blocked)但 exposedArea=0 ✅ 可能
+// 与 blocked 判定(v3 起同为并集口径)的关系:blocked = 覆盖并集 > 18%
+// 或跨层侧边擦及。二者仍非同义:部分被盖(≤阈值)可以 blocked=false 而
+// exposedArea 介于 0~100%;完全被盖(exposedArea=0)在 v3 下必 blocked
+// (并集 ≥ 100% > 阈值,v2.x 的"不可见但可点"缝隙已消除)。
 // 覆盖并集用坐标压缩网格精确求面积(整数坐标,格胞中点采样无歧义)。
 // ============================================================================
 
 import { Tile, TILE, UnitRect } from './tile';
-import { faceRectOf, totalRectOf } from './Occlusion';
+import { faceRectOf, coverRectOf, unionArea } from './Occlusion';
 
 const TILE_AREA = TILE.w * TILE.h;
 
@@ -38,26 +41,7 @@ export interface VisibleState {
   totalExposedArea: number;
 }
 
-/** 轴对齐矩形集合的精确并集面积(坐标压缩 + 格胞中点采样;整数坐标无边界歧义) */
-export function unionArea(rects: ReadonlyArray<UnitRect>): number {
-  if (rects.length === 0) return 0;
-  const xs = Array.from(new Set(rects.flatMap(r => [r.x, r.x + r.w]))).sort((a, b) => a - b);
-  const ys = Array.from(new Set(rects.flatMap(r => [r.y, r.y + r.h]))).sort((a, b) => a - b);
-  let area = 0;
-  for (let i = 0; i < xs.length - 1; i++) {
-    for (let j = 0; j < ys.length - 1; j++) {
-      const cx = (xs[i] + xs[i + 1]) / 2;
-      const cy = (ys[j] + ys[j + 1]) / 2;
-      for (const r of rects) {
-        if (cx > r.x && cx < r.x + r.w && cy > r.y && cy < r.y + r.h) {
-          area += (xs[i + 1] - xs[i]) * (ys[j + 1] - ys[j]);
-          break;
-        }
-      }
-    }
-  }
-  return area;
-}
+/** 轴对齐矩形集合的精确并集面积(坐标压缩;实现迁至 Occlusion.unionArea) */
 
 /** 计算当前版面可见状态;仅 status='pile' 的牌参与(作为主体与遮挡者) */
 export function computeVisibleState(tiles: ReadonlyArray<Tile>): VisibleState {
@@ -71,15 +55,11 @@ export function computeVisibleState(tiles: ReadonlyArray<Tile>): VisibleState {
     const face = faceRectOf(t);
     const covers: UnitRect[] = [];
     for (const u of pile) {
-      // 仅严格更高层覆盖计入(v2.1/v2.2:同层侧边渗入由绘制顺序消化,
-      // 2026-11-20 修复:原先 isAbove 含同层 tileId 序,误将同层侧边计入暴露扣减)
-      if (u.tileId === t.tileId || u.layer <= t.layer) continue;
-      const tot = totalRectOf(u);
-      const ix = Math.max(face.x, tot.x);
-      const iy = Math.max(face.y, tot.y);
-      const iw = Math.min(face.x + face.w, tot.x + tot.w) - ix;
-      const ih = Math.min(face.y + face.h, tot.y + tot.h) - iy;
-      if (iw > 0 && ih > 0) covers.push({ x: ix, y: iy, w: iw, h: ih });
+      if (u.tileId === t.tileId) continue;
+      // v3 统一口径:coverRectOf 内部判 z 序——跨层 totalRect(含侧边),
+      // 同层仅 faceRect(subZ 前排);同层侧边渗入仍不计(绘制序消化)
+      const c = coverRectOf(u, t);
+      if (c) covers.push(c);
     }
     const exposedArea = Math.max(0, faceArea - unionArea(covers));
     const exposedRatio = exposedArea / faceArea;

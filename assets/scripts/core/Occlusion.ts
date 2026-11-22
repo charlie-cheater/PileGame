@@ -1,15 +1,21 @@
 // ============================================================================
-// Occlusion.ts — 遮挡判定(非对称口径 v2)纯逻辑实现
+// Occlusion.ts — 遮挡判定(v3 并集口径,纯逻辑实现)
 //
-// 口径(见 tile.ts 文件头,v2.1):
-//   遮挡者贡献 = 跨层时 totalRect(顶面 ∪ 侧面);同层时仅 faceRect;
-//   被遮挡者受保护面 = faceRect(顶面/信息面);
-//   blocked ⇔ 存在单一遮挡者 t',overlapArea / area(faceRect(t)) > TILE.overlapThreshold
-//             (∃ 语义,不做多遮挡者求和)
-//   同层侧边渗入不算遮挡:侧面是"厚度",只遮挡真正被压在下面的跨层牌;
-//   同层相邻牌的侧边视觉重叠由绘制顺序(层内从后往前)消化,与遮挡无关。
-//   规则⑥:覆盖仅落在自身侧面的面积不构成有效遮挡——统一 TILE 尺寸下
-//          "盖到侧面而不盖顶面"几何不可达,作为安全性条款保留。
+// 口径沿革:
+//   v2.x(2026-11-18~19):blocked ⇔ ∃ 单一遮挡者覆盖 > 阈值(不求和)
+//   v3(2026-11-22 设计确认):多张牌遮挡同一张牌时计算**总遮挡**——
+//     blocked ⇔ 覆盖并集(全部更高牌的投影∩本牌顶面,矩形并集精确求积,
+//     不计交叠双计)/ 顶面面积 > TILE.overlapThreshold
+//     或 跨层侧边擦及顶面任意面积(侧边免阈条款,v2.2 保留:边缘擦碰是
+//     真实的上沿遮挡,与面积求和哲学正交)
+//   可见面积(Visibility)同为并集口径,两模块共用 unionArea/coverRectOf。
+//   v3 消除了 v2.x 的口径缝隙("多张小遮挡拼满 → 不 blocked 但完全不可见")。
+//
+// 成对谓词(v3 起按用途拆分,禁止混用):
+//   · coversAny(o,t)  —— o 对 t 有任意正面积覆盖贡献(z 更高,含同层
+//     subZ 前后)。遮挡 DAG 的边:Depth / OcclusionTopology / 暴露扣减用。
+//   · pressesOn(o,t)  —— v2.2 级"实质压迫"(面对面 > 阈值,或跨层侧边
+//     擦及)。物理支撑语义:LayoutGen 支撑判定用,不随 blocked 口径变化。
 //
 // z 序:三键字典序 (layer, subZ ?? 0, tileId);
 //      第三键兑现 tile.ts "未显式 subZ 时以关卡数组序兜底" 的约定。
@@ -72,58 +78,119 @@ export function overlapArea(a: UnitRect, b: UnitRect): number {
   return w > 0 && h > 0 ? w * h : 0;
 }
 
-/** 遮挡者对目标顶面的覆盖面积(unit²;不含方向/z 判定,同/跨层矩形选择在内)。
- *  仅供信息/调试;判定逻辑以 blocksOcclusion 为准(v2.2 谓词含侧边免阈分支)。 */
-export function occlusionArea(occluder: OcclusionSubject, target: OcclusionSubject): number {
-  const face = faceRectOf(target);
-  const occ = occluder.layer > target.layer ? totalRectOf(occluder) : faceRectOf(occluder);
-  return overlapArea(occ, face);
+/** 轴对齐矩形交集(无交返回 null) */
+function intersectRect(a: UnitRect, b: UnitRect): UnitRect | null {
+  const x = Math.max(a.x, b.x);
+  const y = Math.max(a.y, b.y);
+  const w = Math.min(a.x + a.w, b.x + b.w) - x;
+  const h = Math.min(a.y + a.h, b.y + b.h) - y;
+  return w > 0 && h > 0 ? { x, y, w, h } : null;
 }
 
-/** 完整遮挡谓词(口径 v2.2 单一事实源,2026-11-19 设计确认):
- *  · z 更高 且 面对面覆盖 > 阈值 → 挡
- *  · 跨层时:侧边擦及顶面任意面积(side∩face > 0)即挡 —— 侧边免阈
- *    (侧边条仅 sideH 高,任何可见擦边都是真实的上沿遮挡)
- *  · 同层时:侧边不计(任何面积;v2.1,渗入由绘制顺序消化——前排顶面盖后排侧边)
- *  Occlusion.computeOcclusion 与 Depth.computeDepths 共用,禁止另行复写。 */
-export function blocksOcclusion(occluder: OcclusionSubject, target: OcclusionSubject): boolean {
+/** 轴对齐矩形集合的精确并集面积(坐标压缩 + 格胞中点采样;整数坐标无边界歧义)。
+ *  blocked(v3 并集)与 Visibility(暴露扣减)共用。 */
+export function unionArea(rects: ReadonlyArray<UnitRect>): number {
+  if (rects.length === 0) return 0;
+  const xs = Array.from(new Set(rects.flatMap(r => [r.x, r.x + r.w]))).sort((a, b) => a - b);
+  const ys = Array.from(new Set(rects.flatMap(r => [r.y, r.y + r.h]))).sort((a, b) => a - b);
+  let area = 0;
+  for (let i = 0; i < xs.length - 1; i++) {
+    for (let j = 0; j < ys.length - 1; j++) {
+      const cx = (xs[i] + xs[i + 1]) / 2;
+      const cy = (ys[j] + ys[j + 1]) / 2;
+      for (const r of rects) {
+        if (cx > r.x && cx < r.x + r.w && cy > r.y && cy < r.y + r.h) {
+          area += (xs[i + 1] - xs[i]) * (ys[j + 1] - ys[j]);
+          break;
+        }
+      }
+    }
+  }
+  return area;
+}
+
+// ─────────────────────────── 成对谓词(v3 按用途拆分) ───────────────────────────
+
+/** 覆盖贡献矩形:遮挡者投在被遮挡者顶面上的区域;无贡献返回 null。
+ *  仅 z 更高者可覆盖(同层 = subZ/tileId 前后序,前排盖后排);
+ *  跨层取 totalRect(顶面∪侧面,含侧边),同层仅 faceRect(侧边渗入由
+ *  绘制顺序消化,v2.1 口径保留)。占据模型布局同层恒无交(subZ 布局才有)。 */
+export function coverRectOf(occluder: OcclusionSubject, target: OcclusionSubject): UnitRect | null {
+  if (!isAbove(occluder, target)) return null;
+  const face = faceRectOf(target);
+  const occ = occluder.layer > target.layer ? totalRectOf(occluder) : faceRectOf(occluder);
+  return intersectRect(occ, face);
+}
+
+/** 正贡献谓词:o 对 t 有任意正面积覆盖(遮挡 DAG 边)。
+ *  Depth / OcclusionTopology 使用;并集口径下的保守骨架——移除全部
+ *  贡献者后 t 必暴露(充分),个体未必必要(可能存在冗余贡献者)。 */
+export function coversAny(occluder: OcclusionSubject, target: OcclusionSubject): boolean {
+  return coverRectOf(occluder, target) !== null;
+}
+
+/** 实质压迫谓词(v2.2 原语义):面对面覆盖 > 阈值,或跨层侧边擦及。
+ *  物理支撑语义(LayoutGen 支撑判定/C3):一张牌须真正"压在"另一张上,
+ *  单对判定,不随 blocked 并集口径变化。 */
+export function pressesOn(occluder: OcclusionSubject, target: OcclusionSubject): boolean {
   if (!isAbove(occluder, target)) return false;
   const face = faceRectOf(target);
   if (overlapArea(faceRectOf(occluder), face) / (TILE.w * TILE.h) > TILE.overlapThreshold) return true;
   return occluder.layer > target.layer && overlapArea(sideRectOf(occluder), face) > 0;
 }
 
+/** 单对覆盖面积(unit²;仅供信息/调试)。blocked 判定以 computeOcclusion
+ *  的并集口径为准(v3),勿用本函数复写。 */
+export function occlusionArea(occluder: OcclusionSubject, target: OcclusionSubject): number {
+  return overlapArea(coverRectOf(occluder, target) ?? { x: 0, y: 0, w: 0, h: 0 }, faceRectOf(target));
+}
+
 // ─────────────────────────── 全量重算 ───────────────────────────
 
 /**
  * 计算全部牌的派生态(tileId → TileDerived)。
- * 每次牌堆变化(点击入槽 / 消除 / 撤回 / 洗牌)后调用;O(n²),n ≤ ~60。
+ * 每次牌堆变化(点击入槽 / 消除 / 撤回 / 洗牌)后调用;O(n²) 收集 + 并集求积,n ≤ ~150。
  *
+ * blocked(v3 并集口径):
+ *   覆盖并集 / 顶面面积 > TILE.overlapThreshold,或跨层侧边擦及(免阈条款);
  * 仅 status === 'pile' 的牌作为遮挡者参与;
  * clickable = status === 'pile' && !blocked。
  */
 export function computeOcclusion(tiles: ReadonlyArray<Tile>): Map<number, TileDerived> {
-  const info = tiles.map(t => ({
-    t,
-    face: faceRectOf(t),
-    total: totalRectOf(t),
-    blocked: false,
+  interface Entry {
+    t: Tile;
+    face: UnitRect;
+    total: UnitRect;
+    covers: UnitRect[];
+    sideTouch: boolean;
+    blocked: boolean;
+  }
+  const info: Entry[] = tiles.map(t => ({
+    t, face: faceRectOf(t), total: totalRectOf(t),
+    covers: [], sideTouch: false, blocked: false,
   }));
+
+  const accumulate = (o: OcclusionSubject, e: Entry): void => {
+    const c = coverRectOf(o, e.t);
+    if (!c) return;
+    e.covers.push(c);
+    if (o.layer > e.t.layer && overlapArea(sideRectOf(o), e.face) > 0) e.sideTouch = true;
+  };
 
   for (let i = 0; i < info.length; i++) {
     for (let j = i + 1; j < info.length; j++) {
       const A = info[i];
       const B = info[j];
       if (A.t.status !== 'pile' || B.t.status !== 'pile') continue;
-
-      // ∃ 语义:任一遮挡者满足 v2.2 谓词即挡
-      if (isAbove(B.t, A.t) && blocksOcclusion(B.t, A.t)) A.blocked = true;
-      if (isAbove(A.t, B.t) && blocksOcclusion(A.t, B.t)) B.blocked = true;
+      accumulate(B.t, A);   // isAbove 已在 coverRectOf 内判
+      accumulate(A.t, B);
     }
   }
 
   const result = new Map<number, TileDerived>();
   for (const e of info) {
+    const covered = unionArea(e.covers);   // 并集求积,不计交叠双计
+    e.blocked = e.sideTouch || covered / (TILE.w * TILE.h) > TILE.overlapThreshold;
     result.set(e.t.tileId, {
       blocked: e.blocked,
       clickable: e.t.status === 'pile' && !e.blocked,
@@ -134,6 +201,3 @@ export function computeOcclusion(tiles: ReadonlyArray<Tile>): Map<number, TileDe
   }
   return result;
 }
-
-// 注:若未来需要"多遮挡者并集覆盖"口径(两个各盖 12% → 视为 24% 被挡),
-// 需按矩形并集精确计算(避免交叠双计),当前按定稿 ∃ 口径实现。

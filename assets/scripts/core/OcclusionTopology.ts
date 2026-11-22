@@ -4,18 +4,21 @@
 // 目的:记录每张牌的直接遮挡者并递归构建完整遮挡关系,支持动态计算
 // "让某个被遮挡 tile 暴露"的可能操作路径。
 //
-// 语义(与既有规则严格衔接):
-//   · 直接阻塞者 = 满足 blocksOcclusion(口径 v2.2)的 z 更高牌
-//     —— 必要且充分的暴露集:遮挡纯几何,移除全部直接阻塞者 ⇔ 必然暴露;
-//        任何暴露序也必须移除它们(少一张则该牌仍被那张压住)
+// 语义(与既有规则严格衔接;2026-11-22 v3 并集口径同步):
+//   · 直接阻塞者 = 对该牌有任意正面积覆盖贡献的 z 更高牌(coversAny)
+//     —— 充分性保持:移除全部贡献者 ⇔ 必然暴露(覆盖并集归零);
+//        个体必要性不再保证:并集口径下可能存在冗余贡献者(移除它对
+//        并集是否超阈无影响),最小必要集是直接阻塞者的子集,
+//        由后续求解/按并集阈值裁剪处理
 //   · 传递闭包 = 递归全部前置;DAG 无环由 z 沿边严格递增保证
-//   · 暴露路径 = 闭包 DAG 的线性扩展(合法移除序,不含 target 自身)
+//   · 暴露路径 = 闭包 DAG 的线性扩展(合法移除序,不含 target 自身;
+//     保守骨架:按此序移除必暴露,但未必是最短序)
 //
 // 闭环提示:移除在真实玩法中经"配对"发生 —— 单张阻塞者自身也有 mate,
 // 路径语义是"移除序骨架",配对可行性叠加由后续逆构造/求解器负责。
 // ============================================================================
 
-import { OcclusionSubject, blocksOcclusion } from './Occlusion';
+import { OcclusionSubject, coversAny } from './Occlusion';
 
 export type TopologySlot = OcclusionSubject;
 
@@ -43,7 +46,7 @@ export function buildOcclusionTopology(tiles: ReadonlyArray<TopologySlot>): Occl
   for (const t of tiles) {
     for (const o of tiles) {
       if (o.tileId === t.tileId) continue;
-      if (blocksOcclusion(o, t)) {
+      if (coversAny(o, t)) {
         directBlockers.get(t.tileId)!.push(o.tileId);
         directBlocks.get(o.tileId)!.push(t.tileId);
       }

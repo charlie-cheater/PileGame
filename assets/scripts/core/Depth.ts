@@ -7,7 +7,10 @@
 //
 // 算法:z 是严格全序((layer, subZ, tileId) 字典序),按 z 降序单遍扫描——
 // 处理任一 slot 时,其全部遮挡者(z 更高)均已算完,无需显式拓扑排序。
-// 遮挡判定复用 Occlusion.blocksOcclusion(口径 v2.1 单一事实源)。
+// 遮挡边复用 Occlusion.coversAny(v3 正贡献口径,单一事实源);并集 blocked
+// 口径下深度为保守上界——移除全部贡献遮挡者后 t 必可点(充分),个体
+// 未必必要(冗余贡献者存在);depth=0 ⇔ 无任何贡献 ⇔ 必可点(v3 起与
+// blocked 判定一致,v2.x 曾存在"depth 0 但被并集挡住"的缝隙)。
 //
 // 用途:
 //   · waves 升序 = 可玩波次;降序遍历 = 逆向构造的放置波次(可解性归纳基础)
@@ -15,7 +18,7 @@
 //   · maxDepth = 关卡深度标量(难度曲线原料)
 // ============================================================================
 
-import { OcclusionSubject, blocksOcclusion, isAbove } from './Occlusion';
+import { OcclusionSubject, coversAny, isAbove } from './Occlusion';
 
 /** 深度计算的位置输入(Tile 结构兼容) */
 export type DepthSlot = OcclusionSubject;
@@ -41,7 +44,7 @@ export function computeDepths(slots: ReadonlyArray<DepthSlot>): DepthReport {
     let d = 0;
     for (const other of slots) {
       if (other.tileId === s.tileId) continue;
-      if (blocksOcclusion(other, s)) {
+      if (coversAny(other, s)) {
         d = Math.max(d, (depth.get(other.tileId) ?? 0) + 1);
       }
     }

@@ -7,9 +7,12 @@
 import { _decorator, Component, log, JsonAsset } from 'cc';
 import { Board } from '../core/Board';
 import { generateLayout, RandomLayoutConfig } from '../core/LayoutGen';
-import { LevelData, TILE } from '../core/tile';
+import { LevelData, TILE, ElementDef } from '../core/tile';
 import { computeDepths } from '../core/Depth';
+import { fillSlots } from '../core/RandomFill';
+import { buildMahjongElements } from '../core/MahjongSet';
 import { PileView } from '../view/PileView';
+import { attachAgentDebug } from '../agent/AgentDebug';
 
 const { ccclass, property } = _decorator;
 
@@ -44,6 +47,13 @@ export class LayoutPreview extends Component {
     @property
     public useStrictTorque = false;
 
+    /** 仿真玩家代理:选中交互 debug(点选牌显示效能/匹配消耗;默认开启) */
+    @property
+    public agentDebug = true;
+    /** 代理可视化:静态叠加层(边框/角标/关系线/幽灵/统计行;默认关闭) */
+    @property
+    public agentShowStatic = false;
+
     /** 单张牌显示宽度上限(px);缩放后不得超过 */
     @property
     public maxTilePx = 150;
@@ -51,6 +61,10 @@ export class LayoutPreview extends Component {
     /** 版宽对齐目标 = 屏宽 + 此 margin(负值 = 两侧留白) */
     @property
     public widthMargin = -60;
+
+    /** 随机填充种子(麻将 27 牌型,FULL 全图匹配;0 = 每次随机) */
+    @property
+    public fillSeed = 7;
 
     protected start(): void {
         try {
@@ -84,19 +98,18 @@ export class LayoutPreview extends Component {
             log(`[LayoutPreview] 版面 ${layoutW}×${layoutH} unit · unitPx=${unit.toFixed(2)} `
                 + `(宽适配 ${unitByWidth.toFixed(2)} / 牌宽上限 ${unitByTile.toFixed(2)})`);
 
+            // 随机填充:真实麻将牌面(FULL 全图匹配),替代占位配对
+            const elements = buildMahjongElements();
             const level: LevelData = {
                 board: data.board,
-                elements: [{ elementId: 'x', displayName: '占位', color: '#E8543F' }],
-                tiles: data.tiles.map((t, i) => ({
-                    elementId: 'x',
-                    variant: i % 2 ? 'R' : 'L',
-                    gx: t.gx,
-                    gy: t.gy,
-                    layer: t.layer,
-                    subZ: t.subZ,
-                })),
+                elements,
+                tiles: fillSlots(data.tiles, { elements, seed: this.fillSeed || undefined }),
             };
-            pile.setup(new Board(level), level.elements);
+            log(`[LayoutPreview] 随机填充 ${level.tiles.length} 张`
+                + `(seed=${this.fillSeed || 'random'},麻将 27 牌型)`);
+            const board = new Board(level);
+            pile.setup(board, level.elements);
+            this.runAgentDebug(pile, board, elements);
             return;
         }
 
@@ -105,22 +118,27 @@ export class LayoutPreview extends Component {
         log(`[LayoutPreview] 力矩=${cfg.torqueMode} 层量=${result.stats.layerCounts} `
             + `开局可点=${result.stats.openTiles} maxDepth=${result.stats.maxDepth}`);
 
+        const fillElements = buildMahjongElements();
         const level: LevelData = {
             board: CFG.board,
-            elements: [{ elementId: 'x', displayName: '占位', color: '#E8543F' }],
-            tiles: result.slots.map((s, i) => ({
-                elementId: 'x',
-                variant: i % 2 ? 'R' : 'L',
-                gx: s.gx,
-                gy: s.gy,
-                layer: s.layer,
-                subZ: s.subZ,
-            })),
+            elements: fillElements,
+            tiles: fillSlots(result.slots, { elements: fillElements, seed: this.fillSeed || undefined }),
         };
-        pile.setup(new Board(level), level.elements);
+        const board = new Board(level);
+        pile.setup(board, level.elements);
+        this.runAgentDebug(pile, board, fillElements);
         } catch (e) {
             console.error('[LayoutPreview] 初始化异常', e);
             throw e;   // 调试期向上抛,便于浏览器控制台直接观察
         }
+    }
+
+    /** 挂接仿真玩家代理 debug 可视化(选中交互为主;elements 用于中文名显示) */
+    private runAgentDebug(pile: PileView, board: Board, elements: ElementDef[]): void {
+        if (!this.agentDebug) return;
+        attachAgentDebug(pile, board, {
+            showStatic: this.agentShowStatic,
+            elements,
+        });
     }
 }

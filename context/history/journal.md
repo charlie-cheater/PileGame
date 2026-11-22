@@ -15,6 +15,12 @@
 
 ---
 
+## 2026-11-23 遮挡口径 v3 + 仿真求解器第一里程碑
+- **目标**:修复遮挡规则缺陷(多牌遮挡应计总遮挡);实现仿真玩家代理的感知/分析/迭代闭环并可视化验收
+- **完成**:**①遮挡口径 v3**(2026-11-22 用户裁定:并集求积,消除 v2.x"多张小遮挡拼满→不挡但完全不可见"缝隙):blocked = 覆盖并集 > 18% 或跨层侧边擦及;成对谓词拆分 coversAny(DAG 边)/pressesOn(实质压迫,支撑判定);Depth/OcclusionTopology/Visibility/LayoutGen 全链同步;**v3 等价定理**:感知子集重算覆盖并集 = 真实并集(逐像素最上层绘制者论证)⇒ 主观可点性精确等于真值,可见遮挡 ⇔ 不可点。**②仿真求解器落地**(assets/scripts/agent/):①感知 Perception(感知集 = 有可见像素的 pile 牌;身份识别阈值 0.25 占位;拷贝遮蔽防泄漏)→ ②分析 Analysis(遮挡边/自建深度/揭露闭包/可点性零冲突对账、同类归组、揭露效能·独占遮挡口径、匹配消耗 v2.2:启动牌(两牌中成本最低者,槽内牌 = 成本 0 的启动牌)× 目标牌,获取成本 = 1 + (闭包 + 深度)/2 双口径平均,资源不足仍计算)→ ③决策(随机策略 seed 可重放 + greedyPair 见对先拿对照)→ ④操作(Runner 执行循环,逐步轨迹),⑤预期空实现。**③语料与工具**:RandomFill(骨架 → FULL 随机配对)+ MahjongSet(27 牌型收敛,GameController 复用);LayoutPreview 换真牌面 + 代理 debug(选中交互:两行信息 + 黄/红/紫/青四层高亮;静态叠加层默认关)。**④测试**:tests/ 三套 76 项全绿,盘面统一为 test_layout.json + fill seed 7(与编辑器一致);批量统计:7 元素×5 对 + 见对先拿通关率 29%,35 元素×1 对纯随机 0%。**⑤发现**:游戏现行 seed42 金字塔在 v3 下开局即死(4 可点、互不同型、伴深埋)——验证"元素重复度"分析,关卡重设计待规划器
+- **下一步**:③决策策略消费匹配报告(close>double>hold 排序);⑤预期前向模型与惊讶度信号;难度感知信号(槽压/犹豫度);识别阈值定档(两段式);LevelBuilder FULL 模式小尾巴
+- **备注**:Inspector 开关 agentDebug(选中交互,默认开)/ agentShowStatic(静态层,默认关);仓库迁移至 github.com/charlie-cheater/PileGame(2026-11-22 首提交 9907cce);本轮归档按用户指示执行
+
 ## 2026-11-21 关卡生成算法背景构建与方向确立
 - **目标**:基于布局结构分析信息,为关卡生成算法设计构建背景(算法设计由用户后续提供)
 - **完成**:梳理结构分析工具箱(Depth/OcclusionTopology/Visibility/Statics/LayoutGen)与数据契约(I1~I6);启发式搜索验证背景(NP-completeness 谱系、验证不对称性、算法家族选型);de Bondt arXiv:1203.6559 全文总结(复杂度定理/堵环死锁证书/求解器技术阶梯/布局形态→无解率实证);**确立求解器定位为「仿真玩家代理 × 渐进式规划器」闭环**(EDPCG / simulated playtesting 脉络),用户明确否定传统验证性求解器为目标;推导本作结构性质 P1/P2/P3(单调性 / 双亮对折叠 / 状态归约为已移除集);**现阶段配对形态锁定全图匹配(FULL)**,元素重复度(每元素 2/4/6 张)成为内容设计主轴,二分对延后;归档 map/nodes/level-generation.md + background/solvability-research.md + background/player-model-research.md,同步更新 MAP.md / split-symbol / STATUS

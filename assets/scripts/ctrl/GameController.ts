@@ -13,40 +13,11 @@
 import { _decorator, Component, Node, UITransform, Graphics, Label, Color } from 'cc';
 import { Board } from '../core/Board';
 import { buildLevel, LevelSpec } from '../core/LevelBuilder';
-import { ElementDef } from '../core/tile';
+import { buildMahjongElements } from '../core/MahjongSet';
 import { PileView } from '../view/PileView';
 import { TrayView } from '../view/TrayView';
 
 const { ccclass } = _decorator;
-
-const CN_NUM = ['', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
-const PALETTE = ['#E8543F', '#3D7EA6', '#4C8C4A', '#7B52A1', '#D9822B', '#C2527A'];
-
-/** 27 种牌型:饼 1-9 / 条 1-9 / 万 1-9(风箭留后续关卡) */
-function buildElements(): ElementDef[] {
-  const out: ElementDef[] = [];
-  const push = (suits: Array<[string, string]>) => {
-    for (const [kind, name] of suits) {
-      out.push({
-        elementId: kind,
-        displayName: name,
-        color: PALETTE[out.length % PALETTE.length],
-      });
-    }
-  };
-  const nts: Array<[string, string]> = [];
-  for (let n = 1; n <= 9; n++) {
-    nts.push([`dot${n}`, `${CN_NUM[n]}饼`]);
-  }
-  for (let n = 1; n <= 9; n++) {
-    nts.push([`bam${n}`, `${CN_NUM[n]}条`]);
-  }
-  for (let n = 1; n <= 9; n++) {
-    nts.push([`wan${n}`, `${CN_NUM[n]}万`]);
-  }
-  push(nts);
-  return out;
-}
 
 @ccclass('GameController')
 export class GameController extends Component {
@@ -69,7 +40,7 @@ export class GameController extends Component {
   private newGame(): void {
     const spec: LevelSpec = {
       pattern: { kind: 'pyramid', cols: 5, rows: 5, layers: 4 },
-      elements: buildElements(),
+      elements: buildMahjongElements(),
       pairsPerElement: 1,
       seed: 42,
     };

@@ -1,7 +1,7 @@
 {
   "configurations": [
     {
-      "id": "191e4b0b-3912-497c-a7ec-449b81b18164",
+      "id": "9c53caba-2618-4a94-ab66-8f36ea55d27f",
       "name": "默认配置",
       "description": "自动创建的默认工具配置",
       "tools": [
@@ -108,10 +108,10 @@
           "description": "[DEV-ONLY] Component research & knowledge system.\nActions: message_record_*, message_log*, research_component, explore_component, auto_knowledge, save/get/list/delete/promote_knowledge.\nWorkflow: auto_knowledge(componentType, save:true) → promote_knowledge. Or manual: research → explore → save → promote."
         }
       ],
-      "createdAt": "2026-11-20T15:31:09.186Z",
-      "updatedAt": "2026-11-20T15:31:09.186Z"
+      "createdAt": "2026-11-23T02:25:47.526Z",
+      "updatedAt": "2026-11-23T02:25:47.526Z"
     }
   ],
-  "currentConfigId": "191e4b0b-3912-497c-a7ec-449b81b18164",
+  "currentConfigId": "9c53caba-2618-4a94-ab66-8f36ea55d27f",
   "maxConfigSlots": 5
 }

@@ -1,7 +1,7 @@
 # 项目状态快照
 
 > **会话入口文档**。进入会话先读此文件,离开会话务必同步更新。
-> 最后更新:2026-11-23(遮挡 v3 + 求解器第一里程碑归档)
+> 最后更新:2026-11-23(第三会话归档:②分析收敛 + ③决策扫描梯 v1;「需更多资源的 match」建模方案待评审)
 
 ## 基本信息
 
@@ -10,9 +10,9 @@
 - **平台**:微信小游戏;竖屏 750×1624(设计分辨率已写入工程)
 - **设计北极星**:情绪锚点 → [map/nodes/emotional-anchor.md](map/nodes/emotional-anchor.md)
 - **设计现状总览(认知地图)**:[map/MAP.md](map/MAP.md)
-- **Git**:master,首提交 `3f82e8a`(基础架构里程碑,76 文件)
+- **Git**:远程 github.com/charlie-cheater/PileGame(SSH);主干 `master`(首提交 `9907cce`,副本重建);③决策阶段的工作提交在分支 `agent-decision-ladder`(未合并、未推送)
 
-## 当前阶段:P3 · 关卡生成算法设计 —— 求解器(仿真代理)①②③④已跑通 🟡,⑤预期与规划器未动工
+## 当前阶段:P3 · 关卡生成算法设计 —— 仿真代理 ①②③④ 迭代中:②分析已收敛为单一入口,③决策扫描梯 v1 落地 🟡;「需更多资源的 match」建模方案待评审;⑤预期对账与规划器未动工
 
 ## 已完成(P3)
 
@@ -20,6 +20,8 @@
 - [x] **遮挡口径 v3**(2026-11-22 设计裁定):blocked = 覆盖并集 > 18% 或跨层侧边擦及;成对谓词拆分 coversAny/pressesOn;**等价定理**:感知子集重算 = 真值,可见遮挡 ⇔ 不可点
 - [x] **仿真求解器第一里程碑**(2026-11-23,`assets/scripts/agent/`):①感知(可见像素边界/识别阈值 0.25/身份遮蔽)②分析(遮挡关系/深度/揭露闭包/可点性、同类归组、揭露效能·独占遮挡、**匹配消耗 v2.2**:启动牌×目标牌、槽内 = 0 成本启动牌、获取成本 = 1 + (闭包+深度)/2)③决策(随机 + 见对先拿对照,seed 可重放)④操作(Runner 执行循环+轨迹);随机填充语料(RandomFill)+ 编辑器选中交互 debug;测试三套 76 项全绿(tests/,盘面统一 test_layout.json + seed 7)
 - [x] **背景研究归档**:可解性/验证算法(NP-completeness 谱系、P1/P2/P3 结构性质、de Bondt 技术阶梯、性能注意)→ [background/solvability-research.md](background/solvability-research.md);玩家仿真代理学术脉络与设计素材 → [background/player-model-research.md](background/player-model-research.md)
+- [x] **分析数据深化**(2026-11-23 第二会话):揭露效能 v1.6 **独占面积数据**(ExclusiveCover pair 分布 + area/maxArea 标量,主观口径零成本);匹配消耗 v2.3 递归定价全程探索(四轮口径裁定 → acquireCostR/matchCostR 另档接线,v2.2 值不覆盖)后实测分化过剧(dig 均值 9→86 = 求和 2.8× + 复利 3.1×)→ **回退:mateCost 正式口径 = v1 单跳 flat,递归引擎保留待评估**;峰值口径(并发持有)挂起(人类实时不可算);修复 acquireTop 自指种子 bug;测试 76 → 104 项全绿
+- [x] **③决策扫描梯 v1**(2026-11-23 第三会话):伴去向分类(ready / contained / external / unknown,配对负担不折进成本);②分析收敛(移除 clickConflicts 与 RevealUtility.direct,四份报告内化为 AnalysisResult 子属性,对外仅 `analyze()`);`Ladder.ts` 扫描梯瀑布(可插拔梯 + AgentOperation 三元组:动作 / 原因 / 预期);defaultLadder = slot-close → pair-complete → chain → wander;梯内择优 = 揭示预演 `simulateReveal`(效能 0.7 × Σ激活 + 0.3 × near,求和不归一);chain 梯两类(slot / pair,空槽 < 2 让位,pair 加分 0.3);测试四套 175 项全绿
 
 ## 已完成(P2)
 
@@ -31,7 +33,12 @@
 
 ## 待办(下一步)
 
-- [ ] **求解器深化**:③决策策略消费匹配报告(close>double>hold);⑤预期前向模型与惊讶度;难度感知信号(槽压/犹豫度);识别阈值定档(两段式 τ色/τ印)
+- [ ] **「需更多资源的 match」建模**(方案已提出,待设计者裁定):不改 matchCost,另开派生量 closurePairs(配对次数,计入闭包内部配对)与 holdNeed(持有需求 = 外联 + 未知),预算规则 holdNeed ≤ 空槽数 − 2;在此基础上实现 dig / cheap-hold / forced 三梯。待裁定:余量 2 是否合适、未知与外联是否同权、内部对是否细分
+- [ ] **⑤预期对账**:forecast × 实际感知 → 惊讶度入轨迹;hiddenRisk 计算(设计者另有计划,当前恒 0)
+- [ ] **决策深化**:hardness 的设计意图;chain 的 pair 加分上界(slot 链多揭 1 张 pairs 牌仍胜,未裁定);wander 由均匀随机改显著度加权;人格参数化(各权重 / 失误率 θ)
+- [ ] **分析侧尾巴**:递归档(acquireCostR)利用价值评估(启用需封顶/归一);识别阈值定档(两段式 τ色/τ印);AgentDebug 展示决策信息(效能分解 / chain 链路)
+- [ ] **难度感知信号**:槽压 / 犹豫度(utility − runnerUp 已随轨迹落盘)
+- [ ] **工程清理**:`Occlusion.ts` `unionArea` 的 `flatMap` 在工程编译目标下 12 条类型错误(历史遗留;与 `Array.includes` 同类,微信运行时兼容性待核)
 - [ ] **规划器(生成侧)**:逆向构造/前向生长设计(闭环几何未决)→ 与代理反馈闭环
 - [ ] LevelBuilder 增 FULL 模式(第 6 步现硬编码 L/R 分配;RandomFill 已是 FULL 路径,统一入口)
 - [ ] 游戏现行关卡重设计:seed42 金字塔在 v3 下开局即死(4 可点互不同型、伴深埋),待规划器/重复度调整
@@ -51,6 +58,7 @@
 | 4 | 视觉载体演化:盲盒方案已搁置,现用真实麻将牌面;未来是否回归盲盒/玩具 IP 包装 | 🟡 实践决策,待产品层面复盘 |
 | 5 | 素材管线:AI 生成(工具/prompt 已备)+ 程序切半 | 🟡 用户推进中 |
 | 6 | 元素重复度参数化(每元素 2/4/6 张)与难度曲线目标形态 | 🟡 待关卡生成算法设计 |
+| 7 | 「需更多资源的 match」的资源口径(closurePairs / holdNeed 派生量与预算规则) | 🟡 方案待裁定 |
 
 ## 阻塞
 

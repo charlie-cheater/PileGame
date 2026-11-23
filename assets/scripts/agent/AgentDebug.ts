@@ -14,10 +14,10 @@
 
 import { Node, Graphics, Label, LabelOutline, Color, UITransform, Vec3, EventTouch } from 'cc';
 import { Board } from '../core/Board';
-import { TILE, TileDerived, ElementDef } from '../core/tile';
+import { TILE, ElementDef } from '../core/tile';
 import { PileView } from '../view/PileView';
 import { perceive, UNKNOWN_ELEMENT } from './Perception';
-import { analyze, revealUtility, matchOpportunities } from './Analysis';
+import { analyze } from './Analysis';
 
 export interface AgentDebugOptions {
   /** 静态叠加层(牌边框/深度角标/遮挡关系线/隐藏幽灵/统计行)。
@@ -29,16 +29,18 @@ export interface AgentDebugOptions {
 
 /** 在 PileView 节点上挂接代理 debug 覆盖层(一次性,静态盘面审阅) */
 export function attachAgentDebug(pile: PileView, board: Board, opts: AgentDebugOptions): void {
-  // ── 代理管线:①感知 → ②分析 ──
+  // ── 代理管线:①感知 → ②分析(分析结果保持纯主观;真值对照由本层就地取 board)──
   const view = perceive(board);
-  const realDerived = new Map<number, TileDerived>();
-  for (const t of board.allTiles()) {
-    const d = board.getDerived(t.tileId);
-    if (d) realDerived.set(t.tileId, d);
+  const result = analyze(view);
+  const util = result.reveal;
+  // 独占遮挡按遮挡者分组(direct 字段已移除,由 exclusivePairs 重建)
+  const directOf = new Map<number, number[]>();
+  for (const p of util.exclusivePairs) {
+    let arr = directOf.get(p.above);
+    if (!arr) { arr = []; directOf.set(p.above, arr); }
+    arr.push(p.below);
   }
-  const result = analyze(view, realDerived);
-  const util = revealUtility(view, result);
-  const matches = matchOpportunities(view, result);
+  const matches = result.matches;
 
   // ── 坐标映射(与 PileView.refresh 相同口径)──
   const bw = board.boardSize.w;
@@ -109,12 +111,14 @@ export function attachAgentDebug(pile: PileView, board: Board, opts: AgentDebugO
     const byId = new Map(view.perceived.map(t => [t.tileId, t]));
     let maskedCount = 0;
     let clickableCount = 0;
+    let conflictCount = 0;   // 主观可点性对真值(v3 等价定理,期望 0)
     for (const t of view.perceived) {
       const c = toPx(t.gx, t.gy);
       const w = TILE.w * u;
       const h = TILE.h * u;
       const d = result.derived.get(t.tileId);
       if (d?.clickable) clickableCount++;
+      if (d?.clickable !== board.getDerived(t.tileId)?.clickable) conflictCount++;
 
       g.lineWidth = 3.5;
       g.strokeColor = d?.clickable ? CLICK : BLOCK;
@@ -152,7 +156,7 @@ export function attachAgentDebug(pile: PileView, board: Board, opts: AgentDebugO
     mkLabel(0, bottomY,
       `代理感知 ${view.perceived.length}/${view.totalPileCount} 张 · 未识别 ${maskedCount} · `
       + `可点 ${clickableCount} · 遮挡边 ${result.edges.length} · maxDepth ${result.depth.maxDepth} · `
-      + `可点冲突 ${result.clickConflicts.length}`,
+      + `可点冲突 ${conflictCount}`,
       26, new Color(255, 240, 200, 255));
   }
 
@@ -183,7 +187,7 @@ export function attachAgentDebug(pile: PileView, board: Board, opts: AgentDebugO
       return;
     }
     const isPerceived = view.perceived.some(p => p.tileId === tileId);
-    const targets = util.direct.get(tileId) ?? [];
+    const targets = directOf.get(tileId) ?? [];
     const w = TILE.w * u;
     const h = TILE.h * u;
     const c = toPx(t.gx, t.gy);

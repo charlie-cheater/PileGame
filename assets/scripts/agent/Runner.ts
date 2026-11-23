@@ -1,10 +1,11 @@
 // ============================================================================
 // Runner.ts — 仿真玩家代理 · 执行循环(①感知 → ②分析 → ③决策 → ④操作)
 //
-// v1 决策 = 随机策略(seed 可重放):主观可点集内均匀采样——"随机数据辅助
-// 求解器迭代"的最简形态。策略可插拔(AgentPolicy),贪心/效用策略后续接入;
-// 另附 greedyPairPolicy(见对先拿)作对照基线。
-// ⑤预期 v1 空实现(2026-11-21 循环定稿时的决策)。
+// 决策两轨(2026-11-23 骨架期并存):
+//   · policy(legacy):返回 tileId 的策略(randomPolicy / greedyPairPolicy,
+//     批量统计基线的可重放行为不变)
+//   · decision(v2,优先):产出 Operation(动作+原因+预期)的决策策略,
+//     见 Ladder.ts 扫描梯瀑布;expectation 即 ⑤预期的对账面,随轨迹落盘
 //
 // 每步留存感知/分析摘要(轨迹数据):后续难度感知与规划器反馈的原料。
 // 注意:runAgent 直接驱动 Board(会消耗牌堆)——重复实验须每次新建 Board。
@@ -15,6 +16,7 @@ import { Tile } from '../core/tile';
 import { lcg } from '../core/LevelBuilder';
 import { perceive, SubjectiveView, UNKNOWN_ELEMENT } from './Perception';
 import { analyze, AnalysisResult } from './Analysis';
+import { AgentOperation, DecisionPolicy, LadderContext, OperationTrace } from './Ladder';
 
 /** 决策策略:从主观可点集中选一张,返回 tileId */
 export type AgentPolicy = (ctx: {
@@ -56,6 +58,8 @@ export interface StepRecord {
   /** 该次拾取是否触发配对消除 */
   paired: boolean;
   slotAfter: number;
+  /** v2 决策轨:操作摘要(动作略去——chosenTile 即动作;legacy 路径为空) */
+  operation?: OperationTrace;
 }
 
 export interface RunReport {
@@ -74,6 +78,8 @@ export interface AgentParams {
   seed?: number;
   /** 决策策略(缺省 randomPolicy) */
   policy?: AgentPolicy;
+  /** v2 决策策略(产出 Operation;优先于 policy) */
+  decision?: DecisionPolicy;
   identifyThreshold?: number;
   /** 拾取次数安全上限(缺省 = 总牌数 + 4) */
   maxPicks?: number;
@@ -96,21 +102,33 @@ export function runAgent(board: Board, params: AgentParams = {}): RunReport {
   while (pickCount < maxPicks) {
     if (board.isCleared()) return finish('cleared');
 
-    // ①感知 → ②分析(含与真值的可点性对账)
+    // ①感知 → ②分析(分析结果保持纯主观,不接收真值)
     const view = perceive(board, { identifyThreshold: params.identifyThreshold });
-    const realDerived = new Map(
-      board.allTiles().map(t => [t.tileId, board.getDerived(t.tileId)] as const));
-    const analysis = analyze(view, realDerived);
-    clickConflicts += analysis.clickConflicts.length;
+    const analysis = analyze(view);
+    // 可点性对账在驱动侧做:主观 clickable 对真值(v3 等价定理,期望恒 0)
+    for (const t of view.perceived) {
+      if (analysis.derived.get(t.tileId)?.clickable !== board.getDerived(t.tileId)?.clickable) {
+        clickConflicts++;
+      }
+    }
 
     const clickable = view.perceived
       .filter(t => analysis.derived.get(t.tileId)?.clickable === true);
     if (clickable.length === 0) return finish('no_clickable');
 
-    // ③决策 → ④操作(⑤预期 v1 空实现)
-    const tileId = policy({ view, analysis, clickable, rng });
+    // ③决策:decision(v2,Operation)优先 → 否则 legacy policy(tileId)
+    const ctx: LadderContext = { view, analysis, clickable, rng };
+    let operation: AgentOperation | null = null;
+    let tileId: number;
+    if (params.decision) {
+      operation = params.decision(ctx);
+      tileId = operation.action.tileId;
+    } else {
+      tileId = policy(ctx);
+    }
+    // 防御:选牌须在主观可点集内,否则回退首张(决策策略可信,护栏常在)
     const chosen = clickable.find(t => t.tileId === tileId) ?? clickable[0];
-    const r = board.pick(tileId);
+    const r = board.pick(chosen.tileId);
     pickCount++;
     if (!r.ok) return finish('no_clickable');   // 理论不可达(主观可点 = 真值,v3)
 
@@ -131,6 +149,12 @@ export function runAgent(board: Board, params: AgentParams = {}): RunReport {
       chosenElement: chosen.elementId,
       paired: !!r.paired,
       slotAfter: board.slotCount(),
+      operation: operation
+        ? { rule: operation.reason.rule, note: operation.reason.note,
+            utility: operation.reason.utility, runnerUp: operation.reason.runnerUp,
+            chain: operation.reason.chain,
+            expectation: operation.expectation }
+        : undefined,
     });
 
     if (board.isSlotFull() && !board.findSlotPair()) return finish('slot_full');

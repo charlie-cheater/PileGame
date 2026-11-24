@@ -343,7 +343,8 @@ export interface MatchTileRef {
    *  仅用于配对候选排序(launcher = 成本最低者);不是消耗——
    *  真实消耗见 MatchOpportunity.matchCost(消除模拟的净占用峰值) */
   acquireCost: number;
-  /** 闭包大小(遮挡传递闭包 = 全部揭露需先移除的牌数;可点/槽内 = 0) */
+  /** 闭包大小(遮挡传递闭包 = 全部揭露需先移除的牌数)。槽内 = 0;可点牌通常也是 0,
+   *  但被不足阈值的细条盖住时可点而闭包不为 0——匹配类型不看它,看可点性 */
   revealCount: number;
   /** 是否已在槽中(成本 0 的启动牌) */
   inSlot: boolean;
@@ -390,19 +391,34 @@ export interface MatchOpportunity {
 }
 
 export interface MatchReport {
-  /** 按匹配消耗升序(同成本按 elementId) */
+  /** 保留的全部配对(2026-11-24 起每元素可有多条):按匹配消耗升序,
+   *  同消耗依次按 elementId / 启动牌 / 目标牌 */
   opportunities: MatchOpportunity[];
+  /** elementId → 该元素保留的配对(顺序同 opportunities) */
+  byElement: Map<string, MatchOpportunity[]>;
   /** 当前空槽数 */
   emptySlots: number;
-  /** 各类型机会计数 */
+  /** 各类型配对计数 */
   byType: { close: number; double: number; hold: number; dig: number };
 }
 
+/** 候选牌是否「可直接拿到」:已在槽内,或主观可点(获取成本 = 1)。
+ *  匹配类型与配对保留都看它,不看闭包大小——被不足阈值的细条盖住的牌闭包不为 0,
+ *  但仍然可点(2026-11-24 核对:占据模型的盘面上不出现,任意叠放的盘面上会出现) */
+const isTakeable = (c: MatchTileRef): boolean => c.inSlot || c.acquireCost === 1;
+
 /**
- * 匹配消耗(v4,2026-11-24 设计裁定——消除模拟的净占用峰值):
- *   · 每元素取获取成本最低的两张已识别候选牌(含槽内)组成最优配对
- *   · 启动牌 = 成本最低那张;槽内牌 = 成本 0 的启动牌
- *   · matchCost = 对挖掘区做一次消除模拟,记录**额外槽位占用的峰值**
+ * 匹配机会报告:同一元素的已识别候选牌(槽内 + pile)配对,每个保留的配对做一次
+ * 消除模拟,matchCost = **净占用峰值**——完成这次配对,最多同时占几个新槽位。
+ * 启动牌 = 获取成本低者(槽内牌成本 0,存在即恒为启动牌)。
+ *
+ * 保留哪些配对(2026-11-24 设计裁定;此前每元素只留获取成本最低的一对,使 slot-close /
+ * pair-complete 漏掉了同样能闭对、同样可点的牌):
+ *   · 两张都能直接拿到的配对(close / double 型)——全部保留
+ *   · 需要挖掘的配对(hold / dig 型)——每个元素留获取成本最低的一对
+ *   实测(四档各 500 局,同种子):展开前者使 14 / 23 元素档通关率 66.8% → 73.6%、
+ *   5.6% → 7.4%,7 元素档槽压峰值 2.15 → 1.63;再多保留需挖掘的配对,通关率无可见
+ *   变化,耗时 2~4 倍。
  *
  * 模拟规则:
  *   · 空槽视为无限:不因槽满中断,挖掘区内可合并的配对最终一定合并
@@ -423,8 +439,8 @@ export interface MatchReport {
  *   可合并项 + 待入槽张数、+1/+2 加项规则。共同路径只计一次(并集)、
  *   可合并项的消化、+1 还是 +2,现在是模拟的自然结果而非显式规则。
  *
- * 候选规则的推论(穷举 57699 组几何核实):挖掘区内若有 1 张同元素牌压着某候选,
- *   它必不比被压者贵,会被选为 target——「中间那张被选为 target」是规则的正确行为。
+ * 候选规则的推论(穷举 57699 组几何核实):挖掘区内那张同元素牌压着某候选时,
+ *   它必不比被压者贵,会被选为 target——「中间的那张被选为 target」是规则的正确行为。
  *
  * 主观口径:全部基于感知视图;未识别/隐藏的牌不在候选与闭包内,峰值为真实值的下界。
  * 2026-11-23 起内化为 analyze 的产出步骤(随 AnalysisResult.matches 返回)。
@@ -456,48 +472,79 @@ function matchOpportunities(
     }
     if (candidates.length < 2) return;   // 伴不可见/单张:当前信息下不成对
 
-    candidates.sort((a, b) => a.acquireCost - b.acquireCost || a.tileId - b.tileId);
-    const launcher = candidates[0];
-    const target = candidates[1];
+    // ① 两张都能直接拿到的配对:全部保留
+    const pairs: Array<[MatchTileRef, MatchTileRef]> = [];
+    for (let i = 0; i < candidates.length; i++) {
+      for (let j = i + 1; j < candidates.length; j++) {
+        if (isTakeable(candidates[i]) && isTakeable(candidates[j])) {
+          pairs.push([candidates[i], candidates[j]]);
+        }
+      }
+    }
+    // ② 需挖掘的那条:获取成本最低的一对(两张都能拿到时,它本身就是 ① 里的某个配对)
+    const byCost = candidates.slice().sort((a, b) => a.acquireCost - b.acquireCost || a.tileId - b.tileId);
+    const first = byCost[0];
+    const second = byCost[1];
+    const covered = pairs.some(([p, q]) => (p === first && q === second) || (p === second && q === first));
+    if (!covered) pairs.push([first, second]);
 
-    // 挖掘区:两牌闭包并集(共同路径只计一次;tileId 升序)
-    const regionSet = new Set<number>();
-    for (const id of closureOf(launcher.tileId)) regionSet.add(id);
-    for (const id of closureOf(target.tileId)) regionSet.add(id);
-    const region = [...regionSet].sort((a, b) => a - b);
+    for (const [p, q] of pairs) {
+      // 启动牌 = 获取成本低者(平则 tileId 小者);目标牌 = 另一张
+      const launcher = p.acquireCost < q.acquireCost
+        || (p.acquireCost === q.acquireCost && p.tileId < q.tileId) ? p : q;
+      const target = launcher === p ? q : p;
 
-    const sim = simulateMatch(view, launcher.tileId, target.tileId, region, closureOf,
-      analysis.occlusion, analysis.derived);
+      // 挖掘区:两牌闭包并集(共同路径只计一次;tileId 升序)
+      const regionSet = new Set<number>();
+      for (const id of closureOf(launcher.tileId)) regionSet.add(id);
+      for (const id of closureOf(target.tileId)) regionSet.add(id);
+      const region = [...regionSet].sort((a, b) => a - b);
 
-    const type: MatchType =
-      launcher.inSlot && target.revealCount === 0 ? 'close'
-      : !launcher.inSlot && launcher.revealCount === 0 && target.revealCount === 0 ? 'double'
-      : launcher.revealCount > 0 ? 'dig'
-      : 'hold';
+      const sim = simulateMatch(view, launcher.tileId, target.tileId, region, closureOf,
+        analysis.occlusion, analysis.derived);
 
-    opportunities.push({
-      elementId: g.elementId, launcher, target,
-      matchCost: sim.peak,
-      cost: {
-        region,
-        preexisting: sim.preexisting,
-        occupancy: sim.occupancy,
-        residual: sim.residual,
-        steps: sim.steps,
-        picks: sim.picks,
-      },
-      type,
-      executable: emptySlots >= sim.peak,
-    });
+      // 类型由两张牌能否直接拿到导出:槽内 + 可点 = close;两张可点 = double;
+      // 一张能拿到、另一张被压 = hold;两张都被压 = dig
+      const type: MatchType = launcher.inSlot
+        ? (isTakeable(target) ? 'close' : 'hold')
+        : isTakeable(launcher)
+          ? (isTakeable(target) ? 'double' : 'hold')
+          : 'dig';
+
+      opportunities.push({
+        elementId: g.elementId, launcher, target,
+        matchCost: sim.peak,
+        cost: {
+          region,
+          preexisting: sim.preexisting,
+          occupancy: sim.occupancy,
+          residual: sim.residual,
+          steps: sim.steps,
+          picks: sim.picks,
+        },
+        type,
+        executable: emptySlots >= sim.peak,
+      });
+    }
   });
 
   opportunities.sort((a, b) =>
-    a.matchCost - b.matchCost || (a.elementId < b.elementId ? -1 : 1));
+    a.matchCost - b.matchCost
+    || (a.elementId < b.elementId ? -1 : a.elementId > b.elementId ? 1 : 0)
+    || a.launcher.tileId - b.launcher.tileId
+    || a.target.tileId - b.target.tileId);
+
+  const byElement = new Map<string, MatchOpportunity[]>();
+  for (const o of opportunities) {
+    const arr = byElement.get(o.elementId);
+    if (arr) arr.push(o);
+    else byElement.set(o.elementId, [o]);
+  }
 
   const byType = { close: 0, double: 0, hold: 0, dig: 0 };
   opportunities.forEach(o => { byType[o.type]++; });
 
-  return { opportunities, emptySlots, byType };
+  return { opportunities, byElement, emptySlots, byType };
 }
 
 // ─────────────────────────── 消除模拟(匹配消耗的前向模型,主观) ───────────────────────────

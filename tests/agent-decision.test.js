@@ -106,29 +106,57 @@ console.log('— 梯语义:slot-close / pair-complete / wander —');
       `note="${op.reason.note}"`);
   }
 
-  // slot-close 边界:槽内持伴但伴被压 → MatchReport 为 hold 型(launcher 在槽内)
+  // slot-close 边界 A:槽内持伴,伴**真正被压** → MatchReport 为 hold 型(launcher 在槽内)
   //   → slot-close 让位(行为边界不变,归后续梯);即便该 hold 型可执行也不收。
-  //   几何(X 放 (2,2,L1),端到端搜索核实 176 组有效偏移中取一):X 位于 E1b 下方,
-  //   其**侧面**擦到 E1b 下沿(侧边免阈 → E1b 不可点),E1b 顶面仍大部分可见。
-  //   注意两个坑:满压会让 E1b 完全不可见 → 不进感知集 → 报告里没有 E1;
-  //   X 若横向压到 E1b 上方则同时压住 E1a → E1a 不可点、无法入槽
+  //   几何(X 放 (9,2,L1),探针核实):X 的顶面盖住 E1b 上沿 2 行(16 unit² = 20% > 18%)
+  //   → E1b 不可点;X 的侧面在 E1b 下方,不擦 E1b;E1b 仍大部分可见(进感知集、可识别);
+  //   X 不压 E1a。该配对的模拟计划 = 先拿 X(tileId 4)再拿 E1b,峰值 2。
+  //   (2026-11-24 之前这里用的是 X(2,2,L1):那其实只盖住 E1b 一丝,E1b 可点——见边界 B)
   {
     const bHeld = new Board(level(50, 40, [
       ['E1', 0, 10, 0], ['E1', 9, 10, 0], ['E2', 18, 10, 0], ['E2', 27, 10, 0],
-      ['X', 2, 2, 1],
+      ['X', 9, 2, 1],
     ]));
     const picked = bHeld.pick(0);           // E1a 入槽
     const ctxHeld = buildCtx(bHeld);
-    const held = ctxHeld.analysis.matches.opportunities.find(o => o.elementId === 'E1');
+    const held = ctxHeld.analysis.matches.byElement.get('E1')?.[0];
     const preOk = picked.ok && bHeld.slotCount() === 1
       && held !== undefined && held.type === 'hold' && held.launcher.inSlot
-      && held.target.tileId === 1 && held.target.revealCount > 0;
-    check('边界·前置:E1a 入槽;伴 E1b 被压 → MatchReport 记为 hold 型(launcher 在槽内,target = E1b)',
+      && held.target.tileId === 1 && held.target.revealCount > 0
+      && ctxHeld.analysis.derived.get(1)?.clickable === false;
+    check('边界 A·前置:E1a 入槽;伴 E1b 被压 → MatchReport 记为 hold 型(launcher 在槽内,target = E1b)',
       preOk,
       `pick=${picked.reason ?? 'ok'} slot=${bHeld.slotCount()} type=${held?.type} launcherInSlot=${held?.launcher.inSlot} target=${held?.target?.tileId} targetClosure=${held?.target?.revealCount}`);
-    check('边界:伴被压时 slot-close 让位(不收 hold 型,即便可执行)',
-      preOk && held.executable === true && slotCloseRung.decide(ctxHeld) === null,
-      `held.executable=${held?.executable} peak=${held?.matchCost} empty=${ctxHeld.analysis.matches.emptySlots}`);
+    check('边界 A:伴被压时 slot-close 让位(不收 hold 型,即便可执行);计划 = 先拿压它的 X 再拿伴',
+      preOk && held.executable === true && held.cost.picks.join(',') === '4,1'
+      && slotCloseRung.decide(ctxHeld) === null,
+      `held.executable=${held?.executable} peak=${held?.matchCost} picks=${held?.cost.picks.join(',')} empty=${ctxHeld.analysis.matches.emptySlots}`);
+  }
+
+  // slot-close 边界 B:伴**可点但闭包不为 0**(只被不足阈值的细条盖住)→ 按可点性判为 close 型。
+  //   2026-11-24 核对并修正:此前类型按「闭包大小为 0」判,这种配对会被记成 hold——
+  //   slot-close 让位,随后 dig 梯会先把那一张细条牌拿掉,其实伴直接可点。
+  //   几何(X 放 (2,2,L1)):X 的顶面只盖住 E1b 左下角 1×2(2 unit² = 2.5% < 18%),
+  //   侧面不擦 E1b → E1b 可点,闭包 = {X}
+  {
+    const bSliver = new Board(level(50, 40, [
+      ['E1', 0, 10, 0], ['E1', 9, 10, 0], ['E2', 18, 10, 0], ['E2', 27, 10, 0],
+      ['X', 2, 2, 1],
+    ]));
+    bSliver.pick(0);
+    const ctxS = buildCtx(bSliver);
+    const sliver = ctxS.analysis.matches.byElement.get('E1')?.[0];
+    check('边界 B·前置:伴 E1b 可点,但闭包不为 0(被细条盖住)',
+      ctxS.analysis.derived.get(1)?.clickable === true
+      && (ctxS.analysis.closureSize.get(1) ?? 0) > 0,
+      `clickable=${ctxS.analysis.derived.get(1)?.clickable} closure=${ctxS.analysis.closureSize.get(1)}`);
+    check('边界 B:类型看可点性 → close 型(峰值 1,计划只有「拿伴」一步)',
+      sliver !== undefined && sliver.type === 'close' && sliver.matchCost === 1
+      && sliver.cost.picks.join(',') === '1',
+      `type=${sliver?.type} peak=${sliver?.matchCost} picks=${sliver?.cost.picks.join(',')}`);
+    const opS = slotCloseRung.decide(ctxS);
+    check('边界 B:slot-close 直接收下(拿伴 tileId 1)',
+      opS !== null && opS.action.tileId === 1, `op=${opS && opS.action.tileId}`);
   }
 
   // pair-complete:无槽双亮对 → 预期不闭对(伴在堆不在槽)
@@ -716,6 +744,78 @@ console.log('— pair-complete(拾取差分):候选来源 / 可执行门槛 / �
     run.steps.length > 0 && run.steps.every(s => s.operation.expectation.forecast
       && JSON.stringify(s.operation.expectation.exposes)
         === JSON.stringify(s.operation.expectation.forecast.clickable.map(c => c.tileId))));
+}
+
+console.log('— MatchReport 配对保留扩展(2026-11-24):全部候选参与择优 / 按牌去重 / 差分按元素计 —');
+{
+  // 择优不受候选假值影响:两个择优梯直接拿 tileId 当候选,数值 0 也是合法候选
+  //   X0(0,6,L1) 盖住 Y_a(0,10,L0) 上沿(可见、可识别,但被压);X1(8,10);Y_b(16,10)
+  //   拿 X0:Y 的配对 hold → double(升级 +1),外加 X 自己 double → close → 0/2/2
+  //   拿 X1:只有 X 自己的变化 → 0/1/2
+  const ctx = buildCtx(new Board(level(40, 20, [
+    ['X', 0, 6, 1], ['X', 8, 10, 0], ['Y', 0, 10, 0], ['Y', 16, 10, 0]])));
+  const d0 = pickDelta(0, ctx);
+  const d1 = pickDelta(1, ctx);
+  check('前置:拿 tileId 0 的差分严格优于拿 tileId 1(0/2/2 对 0/1/2)',
+    d0.newExecutable === 0 && d0.upgrades === 2 && d0.peakDrop === 2
+    && d1.newExecutable === 0 && d1.upgrades === 1 && d1.peakDrop === 2,
+    `拿0:${d0.newExecutable}/${d0.upgrades}/${d0.peakDrop} 拿1:${d1.newExecutable}/${d1.upgrades}/${d1.peakDrop}`);
+  const op = pairCompleteRung.decide(ctx);
+  check('择优:候选是数值 tileId(含 0)时也能正常胜出(拿 0),次优 = 1',
+    op.action.tileId === 0 && op.reason.runnerUp !== undefined
+    && op.reason.runnerUp.tileId === 1 && op.reason.runnerUp.score === deltaScore(d1),
+    `拿 ${op.action.tileId} · 次优 ${op.reason.runnerUp?.tileId} · note="${op.reason.note}"`);
+}
+{
+  // slot-close:槽内一张牌有多张可点的伴时,全部参与择优(此前每元素只留获取成本最低的一条)
+  //   槽内 S(tileId 0);Z1(1) 是平牌;Z2(4,L1) 压着 Y_a(2) 的上沿;Y_b(3) 可点
+  //   拿 Z2 才会让 Y 的配对 hold → double;两者平分时 tileId 小的 Z1 会赢,所以必须 Z2 严格更优
+  const b = new Board(level(60, 24, [
+    ['e1', 0, 10, 0], ['e1', 9, 10, 0], ['Y', 18, 10, 0], ['Y', 27, 10, 0], ['e1', 18, 4, 1]]));
+  b.pick(0);
+  const ctx = buildCtx(b);
+  const closes = ctx.analysis.matches.opportunities.filter(o => o.type === 'close');
+  check('slot-close 候选:close 型 2 条,启动牌都是槽内那张,目标分别是 1 与 4',
+    closes.length === 2 && closes.every(o => o.launcher.inSlot && o.launcher.tileId === 0)
+    && closes.map(o => o.target.tileId).join(',') === '1,4',
+    closes.map(o => `${o.launcher.tileId}→${o.target.tileId}`).join(' '));
+  const op = slotCloseRung.decide(ctx);
+  check('slot-close 拿差分更优的那张(tileId 4),不再只看获取成本最低的一条;reason 注明候选 2 张',
+    op.action.tileId === 4 && op.reason.note.includes('候选 2')
+    && op.reason.runnerUp !== undefined && op.reason.runnerUp.tileId === 1,
+    `拿 ${op.action.tileId} · note="${op.reason.note}"`);
+}
+{
+  // pair-complete:同元素三张可点 → 三条 double 配对(六个人选),按牌去重后只预演三张
+  //   A0(0,2) A1(8,2) A2(24,4,L1);A2 压着 Y_a(24,10) 的上沿;Y_b(40,10) 可点
+  const ctx = buildCtx(new Board(level(56, 20, [
+    ['A', 0, 2, 0], ['A', 8, 2, 0], ['Y', 40, 10, 0], ['Y', 24, 10, 0], ['A', 24, 4, 1]])));
+  const doubles = ctx.analysis.matches.opportunities.filter(o => o.type === 'double');
+  check('pair-complete 候选:3 条 double 配对;按牌去重后候选 3 张(不是 6)',
+    doubles.length === 3 && pairCompleteRung.decide(ctx) !== null
+    && pairCompleteRung.decide(ctx).reason.note.includes('候选 3'),
+    `double ${doubles.length} 条 · note="${pairCompleteRung.decide(ctx)?.reason.note}"`);
+  const op = pairCompleteRung.decide(ctx);
+  check('pair-complete 拿三张里差分最优的 tileId 4,并列出它的两个可点伴(0 / 1)',
+    op.action.tileId === 4 && op.reason.note.includes('伴 0/1 可点'),
+    `拿 ${op.action.tileId} · note="${op.reason.note}"`);
+}
+{
+  // 差分按元素计:同一元素一次多出两条可执行配对,不重复计数
+  //   X0(0,6,L1) 压着 Y_a(1) 的上沿;Y_b(2) Y_c(3) 可点 → 拿 X0 后 Y 名下从 1 条 double 变 3 条
+  const ctx = buildCtx(new Board(level(40, 20, [
+    ['X', 0, 6, 1], ['Y', 0, 10, 0], ['Y', 16, 10, 0], ['Y', 24, 10, 0]])));
+  const after = simulateAnalysisAfterPick(0, ctx);
+  const d = pickDelta(0, ctx);
+  check('前置:拿 X0 后 Y 名下 3 条 double(原 1 条)',
+    (ctx.analysis.matches.byElement.get('Y') ?? []).length === 1
+    && (after.matches.byElement.get('Y') ?? []).length === 3
+    && (after.matches.byElement.get('Y') ?? []).every(o => o.type === 'double' && o.executable),
+    `前 ${(ctx.analysis.matches.byElement.get('Y') ?? []).length} 条 · 后 ${(after.matches.byElement.get('Y') ?? []).length} 条`);
+  check('按元素计:Y 原本就可执行、等级不变、最低消耗不变 → 差分 0/0/0(按配对会记成 2/2/0)',
+    d.newExecutable === 0 && d.upgrades === 0 && d.peakDrop === 0
+    && d.detail.appeared.length === 0 && d.detail.upgraded.length === 0,
+    JSON.stringify(d));
 }
 
 console.log(`\n结果:${pass} 通过,${fail} 失败`);

@@ -803,5 +803,57 @@ console.log('— 结果层等价性回归:新模拟 ⇔ 旧的逐步全盘重算
     S.badReveal === 0, `${S.badReveal}/${S.reveals} 次不一致`);
 }
 
+console.log('— MatchReport 配对保留口径(2026-11-24:两张都能直接拿到的全留,需挖掘的每元素留最便宜一对)—');
+{
+  // 盖牌上移 / 错层,使被压牌「可见、可识别,但不可点」(整张盖住的牌不进感知集)
+  const spec = [
+    ['e1', 0, 10, 0], ['e1', 9, 10, 0], ['e1', 18, 10, 0],            // 0 1 2
+    ['e2', 27, 10, 0], ['Xa', 27, 4, 1],                              // 3 被压(闭包 1) 4
+    ['e2', 36, 10, 0], ['Xb', 36, 4, 1], ['Xc', 36, 2, 2],            // 5 被压(闭包 2) 6 7
+    ['e3', 0, 30, 0], ['e3', 9, 30, 0], ['Xd', 9, 24, 1],             // 8 可点 9 被压(闭包 1) 10
+    ['e3', 18, 30, 0], ['Xe', 18, 24, 1], ['Xf', 18, 22, 2],          // 11 被压(闭包 2) 12 13
+    ['e4', 27, 30, 0], ['e4', 36, 30, 0], ['e4', 45, 30, 0],          // 14 15 16 三张可点
+  ];
+  const level = {
+    board: { w: 64, h: 44 },
+    elements: [...new Set(spec.map(s => s[0]))].map(e => ({ elementId: e, displayName: e, color: '#fff' })),
+    tiles: spec.map(([elementId, gx, gy, layer], i) =>
+      ({ elementId, variant: 'FULL', gx, gy, layer, tileId: i })),
+  };
+  const board = new Board(level);
+  board.pick(0);                                   // e1 的第一张入槽
+  const result = analyze(perceive(board));
+  const m = result.matches;
+  const of = e => m.byElement.get(e) ?? [];
+  const shape = e => of(e).map(o => `${o.type}(${o.launcher.tileId},${o.target.tileId})`).join(' ');
+  const closures = [3, 5, 9, 11].map(id => result.closureSize.get(id)).join('/');
+
+  check('前置:被压的 4 张可见、不可点(闭包 1 / 2 / 1 / 2);可点的 6 张可点',
+    [3, 5, 9, 11].every(id => result.derived.get(id)?.clickable === false)
+    && [1, 2, 8, 14, 15, 16].every(id => result.derived.get(id)?.clickable === true)
+    && closures === '1/2/1/2', `闭包 ${closures}`);
+  check('byElement 恰有这 4 个元素,槽内那张(0)不单独成条目',
+    [...m.byElement.keys()].sort().join(',') === 'e1,e2,e3,e4'
+    && m.byElement.get('Xa') === undefined, [...m.byElement.keys()].join(','));
+  check('槽内 1 张 + 可点 2 张:close ×2 + double ×1 全部保留',
+    shape('e1') === 'close(0,1) close(0,2) double(1,2)', shape('e1'));
+  check('可点 3 张:double ×3 全部保留',
+    shape('e4') === 'double(14,15) double(14,16) double(15,16)', shape('e4'));
+  check('可点 1 张 + 被压 2 张:只留最便宜的一对(hold,目标 = 闭包小的那张 9)',
+    shape('e3') === 'hold(8,9)', shape('e3'));
+  check('被压 2 张:只留最便宜的一对(dig,启动牌 = 闭包小的那张 3)',
+    shape('e2') === 'dig(3,5)', shape('e2'));
+  check('byType 按配对计数:close 2 / double 4 / hold 1 / dig 1',
+    JSON.stringify(m.byType) === '{"close":2,"double":4,"hold":1,"dig":1}', JSON.stringify(m.byType));
+  check('byElement 与 opportunities 一致:条目总数相同,元素内顺序相同',
+    m.opportunities.length === [...m.byElement.values()].reduce((s, a) => s + a.length, 0)
+    && [...m.byElement].every(([e, os]) => JSON.stringify(os) === JSON.stringify(m.opportunities.filter(o => o.elementId === e))),
+    `${m.opportunities.length} 对 ${[...m.byElement.values()].reduce((s, a) => s + a.length, 0)}`);
+  check('排序:消耗升序 → elementId → 启动牌 → 目标牌',
+    m.opportunities.map(o => `${o.elementId}:${o.type}:${o.matchCost}`).join(' ')
+      === 'e1:close:1 e1:close:1 e1:double:1 e4:double:2 e4:double:2 e4:double:2 e3:hold:3 e2:dig:5',
+    m.opportunities.map(o => `${o.elementId}:${o.type}:${o.matchCost}`).join(' '));
+}
+
 console.log(`\n结果:${pass} 通过,${fail} 失败`);
 process.exit(fail > 0 ? 1 : 0);

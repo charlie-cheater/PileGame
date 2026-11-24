@@ -32,12 +32,17 @@
 //   (新增可执行匹配 > 类型升级 > 峰值下降总量);原揭示预演两路求和
 //   (0.7 × Σ激活 + 0.3 × near)仅服务于 chain 梯,随其移除而退场。
 //
+// 候选去重与计数口径(2026-11-24,MatchReport 配对保留扩展后):
+//   slot-close 收全部 close 型配对的目标牌,pair-complete 收全部可执行 double 型
+//   配对里的牌——都**按牌去重**,同一张牌每次决策只做一次拾取差分;
+//   差分的三个分量**按元素计数**(见 pickDelta)。
+//
 // 人类可信度边界:单遍扫描不回溯;expectation 只预测「下一步感知可验证」的字段。
 // ============================================================================
 
 import { Tile } from '../core/tile';
 import { SubjectiveView, UNKNOWN_ELEMENT } from './Perception';
-import { analyze, AnalysisResult, MatchOpportunity, MatchType, RevealForecast, simulateReveal } from './Analysis';
+import { analyze, AnalysisResult, MatchOpportunity, MatchReport, MatchType, RevealForecast, simulateReveal } from './Analysis';
 
 // ─────────────────────────── 契约类型 ───────────────────────────
 
@@ -66,19 +71,19 @@ export interface ChosenMatch {
 /** 一次拾取前后分析数据的差异(2026-11-24 设计定论:决策只产生「拾取一张牌」,
  *  故可预演拾取 → 对新盘面重新分析 → 比较差异 → 量化收益)。详见 pickDelta */
 export interface PickDelta {
-  /** 拾取后新出现的「可执行」匹配数(原来做不了、现在能做了) */
+  /** 拾取后新增的「可执行」元素数:原先没有可执行的配对、现在有了 */
   newExecutable: number;
-  /** 类型升级数:同一匹配 (launcher, target) 的可达性跃迁。
-   *  含 新出现的 close / double 型,与 hold→double、dig→hold / double */
+  /** 类型升级数:最好可达等级上升的元素数(dig → hold → double → close)。
+   *  含 新出现就是 close / double 的元素 */
   upgrades: number;
-  /** 保留匹配的峰值下降总量(同一匹配拾取前后的 matchCost 之差,只累计正值) */
+  /** 峰值下降总量:各元素最低消耗在拾取前后的正向差值之和 */
   peakDrop: number;
   /** 诊断明细 */
   detail: {
-    appeared: string[];      // 新出现的匹配(元素:类型)
-    disappeared: string[];   // 消失的匹配(元素:类型)
+    appeared: string[];      // 新出现的元素(元素:最好类型)
+    disappeared: string[];   // 消失的元素(元素:最好类型)
     upgraded: string[];      // 类型升级(元素:旧→新)
-    newExecIds: string[];    // 新增可执行的匹配(元素:类型)
+    newExecIds: string[];    // 新增可执行的元素(元素:最好类型)
   };
 }
 
@@ -203,25 +208,41 @@ function randomPickOp(rule: DecisionRule, ctx: LadderContext): AgentOperation {
 /** 匹配的可达性等级(字典序第二级「类型升级」的度量:数值上升 = 升级) */
 const REACH_RANK: Record<MatchType, number> = { dig: 0, hold: 1, double: 2, close: 3 };
 
-/** 匹配的身份:同一配对在拾取前后用其两张牌标识。**与角色无关**——按 tileId
- *  升序记:launcher / target 互换仍是同一匹配(例:double 的 target 被拿走后
- *  入槽、成本变 0,在新一轮分析里成为 launcher)。若按 (launcher, target) 记,
- *  角色互换会被算成「消失一个 + 新出现一个」:同一对牌因拿的是哪一张而得到
- *  不同的差分(2026-11-24 改造 pair-complete 时发现并修正——该梯对同一匹配的
- *  两张牌各预演一次,身份必须与角色无关,比较才有意义) */
-const matchKey = (o: MatchOpportunity): string => {
-  const a = Math.min(o.launcher.tileId, o.target.tileId);
-  const b = Math.max(o.launcher.tileId, o.target.tileId);
-  return `${a}/${b}`;
-};
+/** 一个元素的匹配概况:名下全部配对里最好的可达等级、最低的消耗、有无可执行的配对 */
+interface ElementReach {
+  bestRank: number;
+  minCost: number;
+  executable: boolean;
+}
 
-/** 新出现的匹配里,属于 close / double 型(可直接闭合)的计入「升级」 */
-function isNewlyCloseLike(o: MatchOpportunity): boolean {
-  return o.type === 'close' || o.type === 'double';
+/** 可达等级 → 类型名(明细用;与 REACH_RANK 的取值对应) */
+const RANK_TYPE: MatchType[] = ['dig', 'hold', 'double', 'close'];
+
+function reachOf(report: MatchReport): Map<string, ElementReach> {
+  const result = new Map<string, ElementReach>();
+  for (const o of report.opportunities) {
+    const rank = REACH_RANK[o.type];
+    const r = result.get(o.elementId);
+    if (!r) {
+      result.set(o.elementId, { bestRank: rank, minCost: o.matchCost, executable: o.executable });
+    } else {
+      if (rank > r.bestRank) r.bestRank = rank;
+      if (o.matchCost < r.minCost) r.minCost = o.matchCost;
+      if (o.executable) r.executable = true;
+    }
+  }
+  return result;
 }
 
 /**
  * 拾取差分:预演拾取 tileId → 重新分析 → 与原分析比较。
+ *
+ * **按元素计数**(2026-11-24 设计裁定;配对保留扩展后同一元素名下可有多条配对,
+ * 按配对数会让「同元素看得见的牌越多、差分越大」):
+ *   · 新增可执行 = 原先没有可执行配对、现在有了的元素数
+ *   · 类型升级 = 最好可达等级上升的元素数(新出现的元素,等级到 double 及以上才计)
+ *   · 峰值下降总量 = 各元素最低消耗的正向差值之和
+ * 三个分量按字典序择优,见 comparePickDelta。
  *
  * 预演范围(2026-11-24 设计裁定):**只在当前感知集上进行**——新露出的牌不进预演,
  * 操作落定后由下一轮 ①感知 → ②分析 纳入。预演是代理决策时的预期,不含尚未
@@ -231,60 +252,41 @@ function isNewlyCloseLike(o: MatchOpportunity): boolean {
  * 纯函数:在视图的拷贝上模拟,不修改 ctx.view 与真实 Board(无需状态恢复)。
  */
 export function pickDelta(tileId: number, ctx: LadderContext): PickDelta {
-  const { view, analysis } = ctx;
   const after = simulateAnalysisAfterPick(tileId, ctx);
-  const key = matchKey;
-  const before = new Map(analysis.matches.opportunities.map(o => [key(o), o]));
-  const afterMap = new Map(after.matches.opportunities.map(o => [key(o), o]));
+  const before = reachOf(ctx.analysis.matches);
+  const afterMap = reachOf(after.matches);
 
-  const appeared: MatchOpportunity[] = [];
-  const disappeared: MatchOpportunity[] = [];
-  const upgraded: Array<{ o: MatchOpportunity; from: MatchType }> = [];
-  for (const o of afterMap.values()) {
-    const b = before.get(key(o));
-    if (!b) appeared.push(o);
-    else if (b.type !== o.type) upgraded.push({ o, from: b.type });
-  }
-  for (const o of before.values()) {
-    if (!afterMap.has(key(o))) disappeared.push(o);
-  }
-
-  // 新增可执行:拾取后可执行、且(新出现 或 原先不可执行)的匹配
-  let newExecutable = 0;
+  const appeared: string[] = [];
+  const disappeared: string[] = [];
+  const upgraded: string[] = [];
   const newExecIds: string[] = [];
-  for (const o of afterMap.values()) {
-    if (!o.executable) continue;
-    const b = before.get(key(o));
-    if (!b || !b.executable) { newExecutable++; newExecIds.push(`${o.elementId}:${o.type}`); }
-  }
-
-  // 升级:保留匹配的可达性上升 + 新出现的 close / double
+  let newExecutable = 0;
   let upgrades = 0;
-  const upgradedNames: string[] = [];
-  for (const u of upgraded) {
-    if (REACH_RANK[u.o.type] > REACH_RANK[u.from]) { upgrades++; upgradedNames.push(`${u.o.elementId}:${u.from}→${u.o.type}`); }
-  }
-  for (const o of appeared) {
-    if (isNewlyCloseLike(o)) { upgrades++; upgradedNames.push(`${o.elementId}:新${o.type}`); }
-  }
-
-  // 峰值下降总量:保留匹配的正向差值之和
   let peakDrop = 0;
-  for (const o of afterMap.values()) {
-    const b = before.get(key(o));
-    if (!b) continue;
-    const d = b.matchCost - o.matchCost;
-    if (d > 0) peakDrop += d;
+  for (const [elementId, a] of afterMap) {
+    const b = before.get(elementId);
+    if (!b) appeared.push(`${elementId}:${RANK_TYPE[a.bestRank]}`);
+    // 新增可执行:现在有可执行的配对,而原先没有(或原先根本没有配对)
+    if (a.executable && !(b && b.executable)) {
+      newExecutable++;
+      newExecIds.push(`${elementId}:${RANK_TYPE[a.bestRank]}`);
+    }
+    // 升级:最好可达等级上升;新出现的元素要到 double 及以上才算
+    // (等价于此前「新出现的 close / double 型」)
+    if (b ? a.bestRank > b.bestRank : a.bestRank >= REACH_RANK.double) {
+      upgrades++;
+      upgraded.push(`${elementId}:${b ? RANK_TYPE[b.bestRank] : '无'}→${RANK_TYPE[a.bestRank]}`);
+    }
+    // 峰值下降:该元素最低消耗的正向差值
+    if (b && b.minCost > a.minCost) peakDrop += b.minCost - a.minCost;
+  }
+  for (const [elementId, b] of before) {
+    if (!afterMap.has(elementId)) disappeared.push(`${elementId}:${RANK_TYPE[b.bestRank]}`);
   }
 
   return {
     newExecutable, upgrades, peakDrop,
-    detail: {
-      appeared: appeared.map(o => `${o.elementId}:${o.type}`),
-      disappeared: disappeared.map(o => `${o.elementId}:${o.type}`),
-      upgraded: upgradedNames,
-      newExecIds,
-    },
+    detail: { appeared, disappeared, upgraded, newExecIds },
   };
 }
 
@@ -304,12 +306,15 @@ export function deltaScore(d: PickDelta): number {
   return (d.newExecutable * BASE + d.upgrades) * BASE + d.peakDrop;
 }
 
-/** 按拾取差分择优:字典序最大者;平分取 tileId 小者(确定性) */
+/** 按拾取差分择优:字典序最大者;平分取 tileId 小者(确定性)。
+ *  候选可以是任意类型,包括数值 0 这类假值(两个择优梯直接传 tileId)——
+ *  「是否已有胜出者」用 found 记,不拿候选本身判真伪 */
 function pickBestByDelta<T>(
   candidates: ReadonlyArray<T>,
   idOf: (t: T) => number,
   deltaOf: (t: T) => PickDelta,
 ): { pick: T; delta: PickDelta; runnerUp?: { tileId: number; delta: PickDelta } } {
+  let found = false;
   let best: T | null = null;
   let bestDelta: PickDelta | null = null;
   let bestId = 0;
@@ -317,12 +322,13 @@ function pickBestByDelta<T>(
   for (const c of candidates) {
     const d = deltaOf(c);
     const id = idOf(c);
-    if (!best || comparePickDelta(d, bestDelta!) > 0
+    if (!found || comparePickDelta(d, bestDelta!) > 0
         || (comparePickDelta(d, bestDelta!) === 0 && id < bestId)) {
-      if (best) runnerUp = { tileId: bestId, delta: bestDelta! };
+      if (found) runnerUp = { tileId: bestId, delta: bestDelta! };
       best = c;
       bestDelta = d;
       bestId = id;
+      found = true;
     } else if (!runnerUp || comparePickDelta(d, runnerUp.delta) > 0) {
       runnerUp = { tileId: id, delta: d };
     }
@@ -357,9 +363,9 @@ export function simulateAnalysisAfterPick(tileId: number, ctx: LadderContext): A
 // ─────────────────────────── 示范梯(休闲基线) ───────────────────────────
 
 /** 梯 1 slot-close:闭合槽内半张——优先闭合,防半张占槽。
- *  候选来源 = MatchReport 中的 close 型匹配(launcher 在槽内、target 可点;
- *  2026-11-24 起,取代原先手扫「槽内牌 → 可点伴」——两者集合等价,但候选
- *  现在自带 matchCost / executable)。
+ *  候选来源 = MatchReport 中全部 close 型配对的目标牌(2026-11-24 配对保留扩展后,
+ *  槽内一张牌可能有多张可点的伴,各自揭出的东西不同)。**按牌去重**:同一张牌
+ *  每次决策只做一次拾取差分。
  *  行为边界不变:只处理立即可闭合的;槽内持伴但伴被压属 hold 型,归后续梯。
  *  择优 = 拾取差分的字典序(2026-11-24 设计裁定):新增可执行匹配数 >
  *  类型升级数 > 保留匹配的峰值下降总量;平分取 tileId 小者。
@@ -367,37 +373,41 @@ export function simulateAnalysisAfterPick(tileId: number, ctx: LadderContext): A
 export const slotCloseRung: DecisionRung = {
   rule: 'slot-close',
   decide(ctx) {
-    const candidates: MatchOpportunity[] = ctx.analysis.matches.opportunities.filter(
+    const closes = ctx.analysis.matches.opportunities.filter(
       o => o.type === 'close' && o.launcher.inSlot);
-    if (candidates.length === 0) return null;
+    // 候选 = 这些配对的目标牌,去重后按 tileId 升序
+    const targetIds = [...new Set(closes.map(o => o.target.tileId))].sort((a, b) => a - b);
+    if (targetIds.length === 0) return null;
 
     const { pick, delta, runnerUp } = pickBestByDelta(
-      candidates,
-      c => c.target.tileId,
-      c => pickDelta(c.target.tileId, ctx));
+      targetIds,
+      id => id,
+      id => pickDelta(id, ctx));
+    const match = closes.find(o => o.target.tileId === pick)!;
     return {
-      action: { type: 'pick', tileId: pick.target.tileId },
+      action: { type: 'pick', tileId: pick },
       reason: {
         rule: this.rule,
-        note: `闭合槽内 tileId ${pick.launcher.tileId}`
+        note: `闭合槽内 tileId ${match.launcher.tileId}`
           + ` · 差分 新增可执行 ${delta.newExecutable} / 升级 ${delta.upgrades} / 峰值降 ${delta.peakDrop}`
           + (runnerUp ? ` · 次优 ${runnerUp.tileId}(可执行 ${runnerUp.delta.newExecutable} / 升级 ${runnerUp.delta.upgrades} / 降 ${runnerUp.delta.peakDrop})` : '')
-          + ` · 消耗 ${pick.matchCost}/${ctx.analysis.matches.emptySlots} 格`,
+          + ` · 消耗 ${match.matchCost}/${ctx.analysis.matches.emptySlots} 格`
+          + ` · 候选 ${targetIds.length}`,
         utility: deltaScore(delta),
         runnerUp: runnerUp ? { tileId: runnerUp.tileId, score: deltaScore(runnerUp.delta) } : undefined,
         delta,
       },
-      expectation: expectForPick(pick.target.tileId, ctx, 'certain'),
+      expectation: expectForPick(pick, ctx, 'certain'),
     };
   },
 };
 
 /** 梯 2 pair-complete:双亮对(P2 折叠)——拿可执行 double 型匹配中的一张。
- *  候选来源 = MatchReport 中**可执行**的 double 型匹配(2026-11-24 改造,流程同
- *  slot-close)。可执行即峰值 ≤ 空槽:double 的峰值为 2,故空槽 < 2 时整梯让位——
- *  不拿一张闭不了的半张去占最后的空槽。
- *  与 slot-close 的最大不同:每个匹配有**两张**可点的牌(launcher 与 target),
- *  拿哪张都能成对,但各自揭出的东西不同——故对两张牌**各做一次**拾取差分预演,
+ *  候选来源 = MatchReport 中**可执行**的 double 型配对里的牌(2026-11-24 配对保留
+ *  扩展后,同元素可点的牌两两成对)。可执行即峰值 ≤ 空槽:double 的峰值为 2,故空槽 < 2
+ *  时整梯让位——不拿一张闭不了的半张去占最后的空槽。
+ *  与 slot-close 的最大不同:一个匹配有**两张**可点的牌(launcher 与 target),拿哪张
+ *  都能成对,但各自揭出的东西不同。**按牌去重**:每张候选牌只做一次拾取差分预演,
  *  一并参与择优。
  *  择优 = 拾取差分的字典序(同 slot-close):新增可执行匹配数 > 类型升级数 >
  *  保留匹配的峰值下降总量;平分取 tileId 小者。进槽成本不计 */
@@ -408,30 +418,42 @@ export const pairCompleteRung: DecisionRung = {
       o => o.type === 'double' && o.executable);
     if (matches.length === 0) return null;
 
-    // 每个匹配的两张牌各预演一次
-    const candidates: Array<{ match: MatchOpportunity; tileId: number }> = [];
+    // 候选 = 这些配对里的牌,去重后按 tileId 升序
+    const tileSet = new Set<number>();
     for (const m of matches) {
-      candidates.push({ match: m, tileId: m.launcher.tileId });
-      candidates.push({ match: m, tileId: m.target.tileId });
+      tileSet.add(m.launcher.tileId);
+      tileSet.add(m.target.tileId);
     }
+    const tileIds = [...tileSet].sort((a, b) => a - b);
 
     const { pick, delta, runnerUp } = pickBestByDelta(
-      candidates, c => c.tileId, c => pickDelta(c.tileId, ctx));
-    const other = pick.tileId === pick.match.launcher.tileId
-      ? pick.match.target.tileId : pick.match.launcher.tileId;
+      tileIds, id => id, id => pickDelta(id, ctx));
+    // 与所拿这张成对的那些可点伴
+    const mateSet = new Set<number>();
+    let elementId = '';
+    let matchCost = 0;
+    for (const m of matches) {
+      if (m.launcher.tileId === pick) {
+        mateSet.add(m.target.tileId); elementId = m.elementId; matchCost = m.matchCost;
+      } else if (m.target.tileId === pick) {
+        mateSet.add(m.launcher.tileId); elementId = m.elementId; matchCost = m.matchCost;
+      }
+    }
+    const mates = [...mateSet].sort((a, b) => a - b);
     return {
-      action: { type: 'pick', tileId: pick.tileId },
+      action: { type: 'pick', tileId: pick },
       reason: {
         rule: this.rule,
-        note: `双亮对 ${pick.match.elementId}:持 tileId ${pick.tileId}(伴 ${other} 可点,P2 折叠)`
+        note: `双亮对 ${elementId}:持 tileId ${pick}(伴 ${mates.join('/')} 可点,P2 折叠)`
           + ` · 差分 新增可执行 ${delta.newExecutable} / 升级 ${delta.upgrades} / 峰值降 ${delta.peakDrop}`
           + (runnerUp ? ` · 次优 ${runnerUp.tileId}(可执行 ${runnerUp.delta.newExecutable} / 升级 ${runnerUp.delta.upgrades} / 降 ${runnerUp.delta.peakDrop})` : '')
-          + ` · 消耗 ${pick.match.matchCost}/${ctx.analysis.matches.emptySlots} 格`,
+          + ` · 消耗 ${matchCost}/${ctx.analysis.matches.emptySlots} 格`
+          + ` · 候选 ${tileIds.length}`,
         utility: deltaScore(delta),
         runnerUp: runnerUp ? { tileId: runnerUp.tileId, score: deltaScore(runnerUp.delta) } : undefined,
         delta,
       },
-      expectation: expectForPick(pick.tileId, ctx),
+      expectation: expectForPick(pick, ctx),
     };
   },
 };
@@ -451,12 +473,14 @@ export function selectDigMatch(ctx: LadderContext): MatchOpportunity | null {
   return cands.slice().sort((a, b) =>
     a.cost.residual.length - b.cost.residual.length
     || a.matchCost - b.matchCost
-    || byElementId(a, b))[0];
+    || byElementId(a, b)
+    || a.launcher.tileId - b.launcher.tileId
+    || a.target.tileId - b.target.tileId)[0];
 }
 
-/** 按 elementId 升序(排序的最终决胜键) */
+/** 按 elementId 升序(排序的决胜键;相等返回 0,交给后面的 tileId 决胜) */
 function byElementId(a: MatchOpportunity, b: MatchOpportunity): number {
-  return a.elementId < b.elementId ? -1 : 1;
+  return a.elementId < b.elementId ? -1 : a.elementId > b.elementId ? 1 : 0;
 }
 
 /** 梯 3 dig:启动一个需要挖掘的匹配。

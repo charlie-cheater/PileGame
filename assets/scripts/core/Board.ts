@@ -10,11 +10,16 @@
 //
 // 依赖:tile.ts(数据契约)、Occlusion.ts(派生态计算)
 // 数据校验(I1~I5)归 LevelCodec,本类信任输入。
+//
+// 派生态 / 可见性的重算时机(2026-11-24,结果与每次全量重算逐值相同):
+//   · 构造 / 撤回 / 洗牌 → 全量 refresh(并重建牌堆的遮挡关系索引)
+//   · 点击入槽 → 增量:只重算被拿走那张牌直接压着的牌(refreshAfterPick)
+//   · 消除 → 不重算(只动槽内的牌,牌堆没变)
 // ============================================================================
 
 import { Tile, TileDef, TileDerived, LevelData, canPair, findPairInSlot } from './tile';
-import { computeOcclusion } from './Occlusion';
-import { computeVisibleState, VisibleState } from './Visibility';
+import { computeOcclusion, buildOcclusionIndex, deriveAfter, OcclusionIndex } from './Occlusion';
+import { computeVisibleState, visibilityAfter, summarizeVisibility, VisibleState } from './Visibility';
 
 /** 槽位容量(不变量 I3) */
 export const SLOT_COUNT = 4;
@@ -34,6 +39,10 @@ export class Board {
   /** 构造器末尾经 refresh() 赋值 */
   private derivedMap!: Map<number, TileDerived>;
   private visibleState!: VisibleState;
+  /** 当前牌堆的遮挡关系索引,及建索引以来离开牌堆的牌——pick 之后增量刷新用
+   *  (见 refreshAfterPick);每次全量 refresh 时重建 */
+  private occlusionIndex!: OcclusionIndex;
+  private readonly offPile = new Set<number>();
   /** 入槽时间序的 tileId 栈(撤回仅允许栈顶) */
   private readonly pickStack: number[] = [];
   /** 注入随机源(洗牌可测试;缺省 Math.random) */
@@ -92,7 +101,7 @@ export class Board {
 
   // ─────────────────────────── 操作 ───────────────────────────
 
-  /** 点击入槽:校验可点 → 最左空位 → 重算派生态 → 返回配对检测结果 */
+  /** 点击入槽:校验可点 → 最左空位 → 增量重算受影响的牌 → 返回配对检测结果 */
   pick(tileId: number): PickResult {
     const t = this.tiles[tileId];
     if (!t) return { ok: false, reason: 'not_found' };
@@ -105,7 +114,7 @@ export class Board {
     t.status = 'slot';
     t.slotIndex = empty;
     this.pickStack.push(tileId);
-    this.refresh();
+    this.refreshAfterPick(t);
 
     const pair = this.findSlotPair();
     return { ok: true, paired: pair ?? undefined };
@@ -120,7 +129,8 @@ export class Board {
     b.status = 'eliminated'; b.slotIndex = null;
     this.removeFromStack(a.tileId);
     this.removeFromStack(b.tileId);
-    this.refresh();
+    // 不重算派生态 / 可见性(2026-11-24):两者都只看牌堆上的牌,消除只动槽内的牌;
+    // 这两张牌的派生态入槽时已是「不可点」,与消除后相同
     return true;
   }
 
@@ -166,9 +176,34 @@ export class Board {
 
   // ─────────────────────────── 内部 ───────────────────────────
 
+  /** 全量重算派生态与可见性(构造 / 撤回 / 洗牌后);同时按当前牌堆重建遮挡关系
+   *  索引,供之后每次 pick 增量刷新 */
   private refresh(): void {
+    this.occlusionIndex = buildOcclusionIndex(this.tiles.filter(t => t.status === 'pile'));
+    this.offPile.clear();
     this.derivedMap = computeOcclusion(this.tiles);
     this.visibleState = computeVisibleState(this.tiles);
+  }
+
+  /** pick 之后的增量刷新(2026-11-24):牌堆里只少了 x 一张,会变的只有它直接压着的牌
+   *  (其余牌的覆盖贡献不变);消除不动牌堆,不重算。结果与全量 refresh 逐值相同
+   *  (tests/board-state 有回归)。派生态与可见性换成新对象——先前取走的引用仍是
+   *  旧快照,与全量重算时一致 */
+  private refreshAfterPick(x: Tile): void {
+    this.offPile.add(x.tileId);
+    const index = this.occlusionIndex;
+    const derivedMap = new Map(this.derivedMap);
+    const byTile = new Map(this.visibleState.byTile);
+    for (const id of index.coveredBy.get(x.tileId) ?? []) {
+      const t = this.tiles[id];
+      if (t.status !== 'pile') continue;   // 先前已被拿走的牌:不在牌堆上,不受影响
+      derivedMap.set(id, deriveAfter(index, t, this.offPile));
+      byTile.set(id, visibilityAfter(index, t, this.offPile));
+    }
+    derivedMap.set(x.tileId, deriveAfter(index, x, this.offPile));
+    byTile.delete(x.tileId);
+    this.derivedMap = derivedMap;
+    this.visibleState = { byTile, ...summarizeVisibility(byTile) };
   }
 
   /** 当前版面可见状态(每次牌堆变化后随 refresh 更新) */

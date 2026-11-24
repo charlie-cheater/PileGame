@@ -239,21 +239,27 @@ export function blockedAfter(index: OcclusionIndex, target: number, removed: Rea
   return isBlockedBy(index.coversOf.get(target) ?? [], removed);
 }
 
+/** 由索引求一张牌的派生态(computeOcclusion 的后半步,对单张牌):按移除集 removed
+ *  剔除已离开牌堆的遮挡者后判被压。与「在 tiles − removed 上重算 computeOcclusion」
+ *  对该牌逐字段相同;牌堆每次只少一张时(Board.pick)用它只重算受影响的牌。
+ *  不在牌堆上的牌:blocked / clickable 均为 false(不看覆盖) */
+export function deriveAfter(index: OcclusionIndex, target: Tile, removed: ReadonlySet<number>): TileDerived {
+  const blocked = target.status === 'pile' && isBlockedBy(index.coversOf.get(target.tileId) ?? [], removed);
+  return {
+    blocked,
+    clickable: target.status === 'pile' && !blocked,
+    faceRect: faceRectOf(target),
+    sideRect: sideRectOf(target),
+    totalRect: totalRectOf(target),
+  };
+}
+
 /** 由索引求全部牌的派生态(computeOcclusion 的后半步,全量;移除集为空)。
  *  已有索引时用它,不要再调 computeOcclusion 重复收集一遍 */
 export function deriveOcclusion(index: OcclusionIndex, tiles: ReadonlyArray<Tile>): Map<number, TileDerived> {
   const none = new Set<number>();
   const result = new Map<number, TileDerived>();
-  for (const t of tiles) {
-    const blocked = t.status === 'pile' && isBlockedBy(index.coversOf.get(t.tileId)!, none);
-    result.set(t.tileId, {
-      blocked,
-      clickable: t.status === 'pile' && !blocked,
-      faceRect: faceRectOf(t),
-      sideRect: sideRectOf(t),
-      totalRect: totalRectOf(t),
-    });
-  }
+  for (const t of tiles) result.set(t.tileId, deriveAfter(index, t, none));
   return result;
 }
 
@@ -272,6 +278,8 @@ export function deriveOcclusion(index: OcclusionIndex, tiles: ReadonlyArray<Tile
  *   collectCovers → deriveOcclusion;输入全为 pile 牌且需要反复按移除集
  *   求被压时(消除模拟、揭示预演),改用 buildOcclusionIndex + deriveOcclusion +
  *   blockedAfter,收集只做一次。
+ *   Board 自 2026-11-24 起只在构造 / 撤回 / 洗牌后全量调用;点击入槽只少一张牌,
+ *   改用 buildOcclusionIndex + deriveAfter 只重算受影响的牌(消除不动牌堆,不必重算)。
  */
 export function computeOcclusion(tiles: ReadonlyArray<Tile>): Map<number, TileDerived> {
   return deriveOcclusion(collectCovers(tiles), tiles);

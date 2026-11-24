@@ -13,13 +13,19 @@
 // 效用/槽压/犹豫度等评估算子属后续批次,输入亦为本文件的产物。
 // 2026-11-23:reveal/groups/matches 全部内化为 analyze() 的产出
 // (AnalysisResult 子属性),独立查询函数不再导出——②分析的对外入口收敛为 analyze。
+// 2026-11-24(设计者指示):AnalysisResult 只保留③决策与④操作实际读取的数据——
+//   遮挡边列表 edges、深度报告 depth、揭露效能 reveal 三项决策阶段不读,
+//   停止随 analyze 计算;它们仍是分析的产物,改由 analyzeStructure 按需产出
+//   (编辑器调试面板与验收测试用),决策路径不再为此付费。
+// 2026-11-24(去重):同一次分析内不再重复计算——遮挡邻接由遮挡关系索引得出
+//   (不再另跑一遍 coversAny 成对循环)、闭包大小与匹配挖掘区共用一次 DFS
+//   (不再另建 OcclusionTopology)、同类归组只做一次;各产出逐项不变。
 // ============================================================================
 
 import { TileDerived, UnitRect } from '../core/tile';
 import { coversAny, buildOcclusionIndex, deriveOcclusion, blockedAfter, coverRectOf, unionArea,
   OcclusionIndex } from '../core/Occlusion';
 import { computeDepths, DepthReport } from '../core/Depth';
-import { buildOcclusionTopology } from '../core/OcclusionTopology';
 import { SLOT_COUNT } from '../core/Board';
 import { SubjectiveView, UNKNOWN_ELEMENT } from './Perception';
 
@@ -31,19 +37,18 @@ export interface OcclusionEdge {
   crossLayer: boolean;
 }
 
+/** ②分析的产物:只含③决策与④操作实际读取的数据(2026-11-24) */
 export interface AnalysisResult {
-  /** 感知子集内的遮挡边集(DAG;真实遮挡 DAG 的可见子图) */
-  edges: OcclusionEdge[];
-  /** 每张感知牌的直接遮挡者 tileId 列表(谁压着我) */
+  /** 每张感知牌的直接遮挡者 tileId 列表(谁压着我;由遮挡关系索引导出) */
   blockersOf: Map<number, number[]>;
-  /** 每张感知牌直接遮挡的牌 tileId 列表(我压着谁;揭露效能 v1 的原料) */
+  /** 每张感知牌直接遮挡的牌 tileId 列表(我压着谁;揭示预演的目标集;
+   *  由遮挡关系索引导出) */
   occludesOf: Map<number, number[]>;
-  /** 代理自建深度报告(waves[0] = 主观立即可点波次) */
-  depth: DepthReport;
   /** tileId → 遮挡传递闭包大小 = 全部揭露该牌需先移除的牌数
-   *  (感知子集口径;复用 OcclusionTopology.allBlockers 单一事实源。
-   *  2026-11-23 起作为匹配消耗的挖掘计量——闭包同时涵盖扇入宽度与
-   *  链深,取代"最长链深度"代理:被 3 张浅牌同压 → 3,被单链深埋 3 层 → 3) */
+   *  (感知子集口径;沿 blockersOf 做记忆化 DFS,成员与匹配消耗的挖掘区
+   *  同出 makeClosureIndex。2026-11-23 起作为匹配消耗的挖掘计量——闭包同时
+   *  涵盖扇入宽度与链深,取代"最长链深度"代理:被 3 张浅牌同压 → 3,
+   *  被单链深埋 3 层 → 3) */
   closureSize: Map<number, number>;
   /** 主观派生态:blocked / clickable / 逻辑矩形 */
   derived: Map<number, TileDerived>;
@@ -51,56 +56,76 @@ export interface AnalysisResult {
    *  由 derived 的同一次收集得出。消除模拟与揭示预演按「移除若干张后再判被压」
    *  查询它(blockedAfter),不必每次全盘重算——同一次分析内各模拟共用 */
   occlusion: OcclusionIndex;
-  /** 揭露效能(独占遮挡口径;随分析产出,2026-11-23 起为子属性) */
-  reveal: RevealUtility;
   /** 同类归组报告(随分析产出) */
   groups: GroupReport;
   /** 匹配机会报告(随分析产出) */
   matches: MatchReport;
 }
 
-/** ②分析:主观视图 → 结构认知 + 全部派生报告(揭露效能 / 同类归组 /
- *  匹配机会,2026-11-23 起全部内化为子属性)。
- *  只接收主观视图,不接收任何真值(对账见 Runner / tests) */
+/** 结构补充:③决策不读取、故不随 analyze 计算的三项(2026-11-24)。
+ *  由 analyzeStructure 按需产出——编辑器调试面板与验收测试用。 */
+export interface StructureExtras {
+  /** 感知子集内的遮挡边集(DAG;真实遮挡 DAG 的可见子图) */
+  edges: OcclusionEdge[];
+  /** 代理自建深度报告(waves[0] = 主观立即可点波次) */
+  depth: DepthReport;
+  /** 揭露效能(独占遮挡口径) */
+  reveal: RevealUtility;
+}
+
+/** ②分析:主观视图 → 决策所需的结构认知 + 派生报告(同类归组 / 匹配机会)。
+ *  只接收主观视图,不接收任何真值(对账见 Runner / tests)。
+ *  不产出 edges / depth / reveal(决策不读),需要时另调 analyzeStructure。
+ *
+ *  同一次分析内不重复计算(2026-11-24;各产出逐项不变):遮挡关系只收集一次
+ *  ——派生态与遮挡邻接(blockersOf / occludesOf)都出自同一份索引;闭包成员只
+ *  求一次——闭包大小与匹配消耗的挖掘区共用;同类归组只做一次 */
 export function analyze(view: SubjectiveView): AnalysisResult {
   const tiles = view.perceived;
 
+  // 遮挡关系只收集一次:索引(结构)+ 派生态(由索引逐牌求面积)
+  const occlusion = buildOcclusionIndex(tiles);
+  const derived = deriveOcclusion(occlusion, tiles);
+
+  // 遮挡邻接 = 索引的两份投影(键按感知序;列表内亦按感知序,与原先的成对循环相同)
+  const blockersOf = new Map<number, number[]>();
+  const occludesOf = new Map<number, number[]>();
+  for (const t of tiles) {
+    blockersOf.set(t.tileId, (occlusion.coversOf.get(t.tileId) ?? []).map(c => c.by));
+    occludesOf.set(t.tileId, [...(occlusion.coveredBy.get(t.tileId) ?? [])]);
+  }
+
+  // 揭露闭包:传递闭包大小 = 闭包成员数(DAG 无环)。成员由记忆化 DFS 求得,
+  // 下面匹配消耗的挖掘区用的是同一份
+  const closureOf = makeClosureIndex(blockersOf);
+  const closureSize = new Map<number, number>();
+  for (const t of tiles) closureSize.set(t.tileId, closureOf(t.tileId).length);
+
+  // 组装:基础结构先行,派生报告依序产出(均消费 analysis 本体)
+  const analysis = { blockersOf, occludesOf, closureSize, derived, occlusion } as AnalysisResult;
+  analysis.groups = groupByIdentity(view, analysis);
+  analysis.matches = matchOpportunities(view, analysis, analysis.groups, closureOf);
+  return analysis;
+}
+
+/** 结构补充(按需):遮挡边列表 / 深度报告 / 揭露效能。
+ *  ③决策不读取这三项,故不随 analyze 计算(2026-11-24);编辑器调试面板与
+ *  验收测试需要时调用。与停算之前的 analyze 产出逐项相同 */
+export function analyzeStructure(view: SubjectiveView): StructureExtras {
+  const tiles = view.perceived;
   const edges: OcclusionEdge[] = [];
-  const blockersOf = new Map<number, number[]>(tiles.map(t => [t.tileId, [] as number[]]));
-  const occludesOf = new Map<number, number[]>(tiles.map(t => [t.tileId, [] as number[]]));
   for (let i = 0; i < tiles.length; i++) {
     for (let j = i + 1; j < tiles.length; j++) {
       const a = tiles[i];
       const b = tiles[j];
       if (coversAny(a, b)) {
         edges.push({ above: a.tileId, below: b.tileId, crossLayer: a.layer !== b.layer });
-        blockersOf.get(b.tileId)!.push(a.tileId);
-        occludesOf.get(a.tileId)!.push(b.tileId);
       } else if (coversAny(b, a)) {
         edges.push({ above: b.tileId, below: a.tileId, crossLayer: a.layer !== b.layer });
-        blockersOf.get(a.tileId)!.push(b.tileId);
-        occludesOf.get(b.tileId)!.push(a.tileId);
       }
     }
   }
-
-  const depth = computeDepths(tiles);
-  // 遮挡关系只收集一次:索引(结构)+ 派生态(由索引逐牌求面积)
-  const occlusion = buildOcclusionIndex(tiles);
-  const derived = deriveOcclusion(occlusion, tiles);
-
-  // 揭露闭包:传递闭包大小(OcclusionTopology 单一事实源;DAG 无环)
-  const closureSize = new Map<number, number>();
-  const topo = buildOcclusionTopology(tiles);
-  topo.allBlockers.forEach((list, id) => closureSize.set(id, list.length));
-
-  // 组装:基础结构先行,派生报告依序产出(均消费 analysis 本体;
-  // groups/matches 各自内部会再调 groupByIdentity,当前规模下重算可接受)
-  const analysis = { edges, blockersOf, occludesOf, depth, closureSize, derived, occlusion } as AnalysisResult;
-  analysis.reveal = revealUtility(view, edges);
-  analysis.groups = groupByIdentity(view, analysis);
-  analysis.matches = matchOpportunities(view, analysis);
-  return analysis;
+  return { edges, depth: computeDepths(tiles), reveal: revealUtility(view, edges) };
 }
 
 // ─────────────────────────── 分析扩展:揭露效能 ───────────────────────────
@@ -114,7 +139,8 @@ export interface ExclusiveCover {
   area: number;
 }
 
-/** 揭露效能(独占遮挡口径;作为 AnalysisResult.reveal 随分析产出,2026-11-23) */
+/** 揭露效能(独占遮挡口径;2026-11-23 起内化为分析产出,2026-11-24 起由
+ *  analyzeStructure 按需产出,见 StructureExtras.reveal) */
 export interface RevealUtility {
   /** tileId → 独占遮挡数(感知子集口径,真实值的下界;全部感知牌入表,无为 0)。
    *  独占 = 至少一像素仅由它覆盖 = exclusivePairs 按 above 计数;
@@ -154,8 +180,9 @@ export interface RevealUtility {
  *     代理不可知,该像素仍计入可见遮挡者的独占(主观语义"我移走它就能看到
  *     下面"——真值上露出的可能是隐藏牌的顶面,即⑤预期阶段的惊讶来源)。
  *
- * 2026-11-23 起内化为 analyze 的产出步骤(随 AnalysisResult.reveal 返回),
- * 不再单独导出;direct 字段移除(exclusivePairs 按 above 分组即得)。
+ * 2026-11-23 起内化为分析的产出步骤;2026-11-24 起只由 analyzeStructure
+ * 按需产出(③决策不读取揭露效能)。direct 字段已移除
+ * (exclusivePairs 按 above 分组即得)。
  */
 function revealUtility(view: SubjectiveView, edges: ReadonlyArray<OcclusionEdge>): RevealUtility {
   const byId = new Map(view.perceived.map(t => [t.tileId, t]));
@@ -225,8 +252,6 @@ export function flatCostOf(tileId: number, analysis: AnalysisResult): number {
 /** 已识别同型牌的单条记录(找伴素材) */
 export interface IdentifiedTileRecord {
   tileId: number;
-  /** 代理自建深度(感知子集口径) */
-  depth: number;
   clickable: boolean;
 }
 
@@ -271,7 +296,6 @@ function groupByIdentity(view: SubjectiveView, analysis: AnalysisResult): GroupR
     if (t.elementId === UNKNOWN_ELEMENT) { unknown++; continue; }
     ensure(t.elementId).pile.push({
       tileId: t.tileId,
-      depth: analysis.depth.depth.get(t.tileId) ?? 0,
       clickable: analysis.derived.get(t.tileId)?.clickable === true,
     });
   }
@@ -288,17 +312,20 @@ function groupByIdentity(view: SubjectiveView, analysis: AnalysisResult): GroupR
 
 // ─────────────────────────── 分析扩展:匹配消耗(启动牌 × 目标牌) ───────────────────────────
 
-/** 闭包成员索引工厂(记忆化 DFS over blockersOf,与 OcclusionTopology.allBlockers
- *  同源即 closureSize 的成员版;tileId 升序确定性输出)。匹配消耗的挖掘区
- *  与消除模拟的挖牌候选共用。 */
-function makeClosureIndex(analysis: AnalysisResult): (id: number) => number[] {
+/** 闭包成员索引工厂:对遮挡邻接(谁压着我)做记忆化 DFS,返回「某张牌的全部
+ *  前置遮挡者」查询(tileId 升序确定性输出)。揭露闭包大小(closureSize)与
+ *  匹配消耗的挖掘区、消除模拟的挖牌候选同出此一处(2026-11-24 起不再为
+ *  closureSize 另建 OcclusionTopology——那只为取 allBlockers 的长度)。 */
+function makeClosureIndex(
+  blockersOf: ReadonlyMap<number, ReadonlyArray<number>>,
+): (id: number) => number[] {
   const memo = new Map<number, number[]>();
   return (id: number): number[] => {
     const hit = memo.get(id);
     if (hit) return hit;
     const set = new Set<number>();
     const walk = (x: number): void => {
-      for (const b of analysis.blockersOf.get(x) ?? []) {
+      for (const b of blockersOf.get(x) ?? []) {
         if (!set.has(b)) { set.add(b); walk(b); }
       }
     };
@@ -401,11 +428,15 @@ export interface MatchReport {
  *
  * 主观口径:全部基于感知视图;未识别/隐藏的牌不在候选与闭包内,峰值为真实值的下界。
  * 2026-11-23 起内化为 analyze 的产出步骤(随 AnalysisResult.matches 返回)。
+ * 入参 groups / closureOf 由 analyze 算好传入(同类归组与闭包成员只求一次)。
  */
-function matchOpportunities(view: SubjectiveView, analysis: AnalysisResult): MatchReport {
-  const groups = groupByIdentity(view, analysis);
+function matchOpportunities(
+  view: SubjectiveView,
+  analysis: AnalysisResult,
+  groups: GroupReport,
+  closureOf: (id: number) => number[],
+): MatchReport {
   const emptySlots = SLOT_COUNT - view.slot.length;
-  const closureOf = makeClosureIndex(analysis);
 
   const opportunities: MatchOpportunity[] = [];
 

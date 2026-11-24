@@ -52,6 +52,7 @@
 - 代码注释按 **n ≤ ~60** 设计(O(n²) 穷举、无空间索引);一次性分析到 300 张仍毫秒级,**热循环**(求解器反复调用分析函数)才是真实风险
 - 隐蔽点:`Visibility.unionArea` 最坏 ~O(n⁴)(全量 computeVisibleState),且 `Board.refresh()` 无条件计算;`OcclusionTopology.zOf` 用线性 `find` 嵌在闭包排序比较器里
 - 上探优化次序:unionArea 扫描线 / 调试开启才算 → zOf 改 Map 索引 → 遮挡按层分桶;增量更新待算法定稿后按调用频度决定
+- 2026-11-24 更新:上面两条的热点已处理——`Board` 只在构造 / 撤回 / 洗牌后全量刷新,`pick` 后增量(只重算被拿走那张牌直接压着的牌)、`eliminate` 后不刷新;代理的 `analyze` 不再调用 `OcclusionTopology`(闭包大小改由记忆化 DFS),遮挡关系每次分析只收集一次。`unionArea` 与 `zOf` 本身未改;默认梯 400 局 38.8 → 13.3 秒,结果逐项不变(见 map/nodes/level-generation.md「运行性能」)
 - 硬上限:`countExposePaths` 闭包 > 20 拒绝精确计数;`enumerateExposePaths` 截断 16 条
 
 ## 参考

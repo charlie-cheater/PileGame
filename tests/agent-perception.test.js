@@ -21,7 +21,7 @@ const { fillSlots } = require('../temp/v3check/core/RandomFill');
 const { buildMahjongElements } = require('../temp/v3check/core/MahjongSet');
 const { lcg } = require('../temp/v3check/core/LevelBuilder');
 const { perceive, UNKNOWN_ELEMENT } = require('../temp/v3check/agent/Perception');
-const { analyze, simulateReveal } = require('../temp/v3check/agent/Analysis');
+const { analyze, analyzeStructure, simulateReveal } = require('../temp/v3check/agent/Analysis');
 const { decideByLadder, defaultLadder } = require('../temp/v3check/agent/Ladder');
 
 let pass = 0, fail = 0;
@@ -79,23 +79,48 @@ console.log('— 分析:遮挡关系 / 深度 / 可点性 —');
   const board = buildEditorBoard();
   const view = perceive(board);
   const result = analyze(view);
+  // 2026-11-24:遮挡边 / 深度 / 揭露效能③决策不读,不再随 analyze 计算,
+  // 改由 analyzeStructure 按需产出——结构类断言改读它
+  const extras = analyzeStructure(view);
+
+  check('analyze 不携带决策不读的三项(edges / depth / reveal)',
+    !('edges' in result) && !('depth' in result) && !('reveal' in result));
+  check('analyzeStructure 按需产出这三项',
+    Array.isArray(extras.edges) && !!extras.depth && !!extras.reveal
+    && result.groups !== undefined && result.matches !== undefined);
 
   const perIds = new Set(view.perceived.map(t => t.tileId));
   check('遮挡边全部落在感知子集内',
-    result.edges.every(e => perIds.has(e.above) && perIds.has(e.below)));
+    extras.edges.every(e => perIds.has(e.above) && perIds.has(e.below)));
+
+  // 独立复算:感知集上的成对 coversAny(条数与方向逐条一致)
+  const expectEdges = new Set();
+  for (const a of view.perceived) for (const b of view.perceived) {
+    if (a.tileId !== b.tileId && coversAny(a, b)) expectEdges.add(a.tileId + '->' + b.tileId);
+  }
+  check(`遮挡边 = 感知集上的成对 coversAny(${extras.edges.length} 条,跨层 ${
+    extras.edges.filter(e => e.crossLayer).length})`,
+    extras.edges.length === expectEdges.size
+    && extras.edges.every(e => expectEdges.has(e.above + '->' + e.below)));
 
   const realEdges = new Set();
   const all = board.allTiles();
   for (const a of all) for (const b of all) {
     if (a.tileId !== b.tileId && coversAny(a, b)) realEdges.add(a.tileId + '->' + b.tileId);
   }
-  check(`感知边 ⊆ 真实边(感知 ${result.edges.length} / 真实 ${realEdges.size})`,
-    result.edges.every(e => realEdges.has(e.above + '->' + e.below)));
+  check(`感知边 ⊆ 真实边(感知 ${extras.edges.length} / 真实 ${realEdges.size})`,
+    extras.edges.every(e => realEdges.has(e.above + '->' + e.below)));
 
   const realDepth = computeDepths(all);
+  const subsetDepth = computeDepths(view.perceived);
+  check('代理深度 = 感知子集上的 computeDepths(与停算前口径一致)',
+    extras.depth.maxDepth === subsetDepth.maxDepth
+    && JSON.stringify(extras.depth.waves) === JSON.stringify(subsetDepth.waves)
+    && [...subsetDepth.depth].every(([id, d]) => extras.depth.depth.get(id) === d)
+    && extras.depth.depth.size === subsetDepth.depth.size);
   check('代理深度 ≤ 真实深度(感知子图的下界)',
     view.perceived.every(t =>
-      (result.depth.depth.get(t.tileId) ?? 0) <= (realDepth.depth.get(t.tileId) ?? 0)));
+      (extras.depth.depth.get(t.tileId) ?? 0) <= (realDepth.depth.get(t.tileId) ?? 0)));
 
   const conflicts = clickConflicts(board, view, result);
   check('v3 等价定理:主观可点性与真值零冲突', conflicts.length === 0,
@@ -103,8 +128,82 @@ console.log('— 分析:遮挡关系 / 深度 / 可点性 —');
   const subjectiveClickable = view.perceived.filter(t => result.derived.get(t.tileId).clickable).length;
   const realClickable = board.clickableTiles().length;
   check(`主观可点数 = 真实可点数(${subjectiveClickable})`, subjectiveClickable === realClickable);
-  check('blockersOf 与边集一致',
-    result.edges.every(e => (result.blockersOf.get(e.below) || []).includes(e.above)));
+  check('blockersOf / occludesOf 与边集一致(决策路径仍保留这两份)',
+    extras.edges.every(e => (result.blockersOf.get(e.below) || []).includes(e.above))
+    && extras.edges.every(e => (result.occludesOf.get(e.above) || []).includes(e.below)));
+}
+
+console.log('— 分析去重:同一次分析内不重复计算,产出逐项不变(2026-11-24)—');
+{
+  const { buildOcclusionTopology } = require('../temp/v3check/core/OcclusionTopology');
+  // 独立参照 = 去重之前的做法:遮挡邻接来自 coversAny 成对循环,
+  // 闭包大小来自 OcclusionTopology.allBlockers 的长度
+  const legacyAdjacency = (perceived) => {
+    const blockersOf = new Map(perceived.map(t => [t.tileId, []]));
+    const occludesOf = new Map(perceived.map(t => [t.tileId, []]));
+    for (let i = 0; i < perceived.length; i++) {
+      for (let j = i + 1; j < perceived.length; j++) {
+        const a = perceived[i], b = perceived[j];
+        if (coversAny(a, b)) {
+          blockersOf.get(b.tileId).push(a.tileId);
+          occludesOf.get(a.tileId).push(b.tileId);
+        } else if (coversAny(b, a)) {
+          blockersOf.get(a.tileId).push(b.tileId);
+          occludesOf.get(b.tileId).push(a.tileId);
+        }
+      }
+    }
+    return { blockersOf, occludesOf };
+  };
+  // 键、值、顺序逐项比(邻接列表按感知序——消费端不依赖这个顺序,
+  // 保持一致是为了改动前后逐项相同)
+  const sameMap = (a, b) => a.size === b.size && JSON.stringify([...a]) === JSON.stringify([...b]);
+
+  const verify = (view, label) => {
+    const r = analyze(view);
+    const legacy = legacyAdjacency(view.perceived);
+    const topo = buildOcclusionTopology(view.perceived);
+    let closureOk = r.closureSize.size === view.perceived.length;
+    for (const t of view.perceived) {
+      if (r.closureSize.get(t.tileId) !== (topo.allBlockers.get(t.tileId) ?? []).length) closureOk = false;
+    }
+    check(`${label}:邻接表 = 原先的成对循环(键序与列表顺序逐项一致)`,
+      sameMap(r.blockersOf, legacy.blockersOf) && sameMap(r.occludesOf, legacy.occludesOf));
+    check(`${label}:闭包大小 = 遮挡拓扑的闭包长度(全部 ${view.perceived.length} 张感知牌)`, closureOk);
+  };
+
+  // 编辑器盘:开局 + 拾取若干张后的中盘(槽内有牌)
+  const board = buildEditorBoard();
+  verify(perceive(board), '编辑器盘开局');
+  let picked = 0;
+  for (let i = 0; i < 20 && !board.isSlotFull(); i++) {
+    const clickable = board.clickableTiles();
+    const r = board.pick(clickable[i % clickable.length].tileId);
+    if (!r.ok) break;
+    picked++;
+    if (r.paired) { board.eliminate(r.paired[0], r.paired[1]); board.compactSlots(); }
+  }
+  const mid = perceive(board);
+  verify(mid, `编辑器盘拾取 ${picked} 张后`);
+  check(`编辑器盘中盘确有槽内牌(${mid.slot.length} 张)且邻接非空(用例有效)`,
+    mid.slot.length > 0
+    && [...analyze(mid).occludesOf.values()].reduce((s, l) => s + l.length, 0) > 0);
+
+  // 合成盘:感知序 ≠ tileId 升序——邻接列表仍按感知序(同层牌互不重叠)。
+  // L0:牌 7 (0,10)、牌 1 (9,10);L1:牌 3 (4,10) 压着 7 与 1,牌 9 (4,22);
+  // L2:牌 2 (4,16) 连侧面压着 3、9、7、1
+  const mkS = (tileId, gx, gy, layer) =>
+    ({ elementId: 'x', variant: 'FULL', gx, gy, layer, tileId, status: 'pile', slotIndex: null });
+  const shuffled = {
+    perceived: [mkS(3, 4, 10, 1), mkS(1, 9, 10, 0), mkS(7, 0, 10, 0), mkS(9, 4, 22, 1), mkS(2, 4, 16, 2)],
+    slot: [], exposure: new Map(), totalPileCount: 5,
+  };
+  verify(shuffled, '感知序打乱的合成盘');
+  const sa = analyze(shuffled);
+  check('合成盘用例有效:遮挡邻接 6 条;牌 2 压着的四张按感知序为 [3, 1, 7, 9](非 tileId 升序)',
+    JSON.stringify(sa.occludesOf.get(2)) === '[3,1,7,9]'
+    && [...sa.occludesOf.values()].reduce((s, l) => s + l.length, 0) === 6
+    && JSON.stringify(sa.blockersOf.get(7)) === '[3,2]');
 }
 
 console.log('— 动态:拾取后感知单调增长 —');
@@ -147,11 +246,11 @@ console.log('— 分析扩展:同类归组 —');
     [...report.groups.values()].every(g =>
       g.pile.every(r => board.getTile(r.tileId).elementId === g.elementId)));
 
-  check('记录深度/可点性与结构分析一致',
+  check('记录只含 tileId / clickable(深度随停算移除),可点性与结构分析一致',
     [...report.groups.values()].every(g =>
       g.pile.every(r =>
-        r.depth === (result.depth.depth.get(r.tileId) ?? 0) &&
-        r.clickable === (result.derived.get(r.tileId)?.clickable === true))));
+        Object.keys(r).length === 2 && !('depth' in r)
+        && r.clickable === (result.derived.get(r.tileId)?.clickable === true))));
 
   const multiGroups = [...report.groups.values()].filter(g => g.pile.length >= 2);
   const doubleLit = multiGroups.filter(g => g.pile.filter(r => r.clickable).length >= 2);
@@ -177,15 +276,16 @@ console.log('— 分析扩展:揭露效能(独占遮挡口径)—');
   const board = buildEditorBoard();
   const view = perceive(board);
   const result = analyze(view);
-  const util = result.reveal;
+  const extras = analyzeStructure(view);
+  const util = extras.reveal;
 
   check('occludesOf 与边集对偶(每条边 above→below 各计一次)',
-    result.edges.every(e => result.occludesOf.get(e.above).includes(e.below))
-    && result.edges.every(e => result.blockersOf.get(e.below).includes(e.above)));
+    extras.edges.every(e => result.occludesOf.get(e.above).includes(e.below))
+    && extras.edges.every(e => result.blockersOf.get(e.below).includes(e.above)));
 
   // 独占 ⊆ 投影相交(结构关系)
   const occludes = new Map();
-  result.edges.forEach(e => {
+  extras.edges.forEach(e => {
     if (!occludes.has(e.above)) occludes.set(e.above, new Set());
     occludes.get(e.above).add(e.below);
   });
@@ -244,7 +344,7 @@ console.log('— 分析扩展:揭露效能(独占遮挡口径)—');
   const sQ = mkS(2, 3, 10, 1);
   const sR = mkS(3, -6, 10, 2);
   const sv = { perceived: [X, sP, sQ, sR], slot: [], exposure: new Map(), totalPileCount: 4 };
-  const sr = analyze(sv);
+  const sr = analyzeStructure(sv);
   const su = sr.reveal;
   check('合成盘:张数口径 Q=R=1 同权(P 与 R 互为冗余为 0)',
     su.count.get(1) === 0 && su.count.get(2) === 1 && su.count.get(3) === 1,
@@ -262,7 +362,7 @@ console.log('— 分析扩展:揭露效能(独占遮挡口径)—');
   board.pick(maxHolders[0].tileId);
   const view2 = perceive(board);
   const result2 = analyze(view2);
-  const util2 = result2.reveal;
+  const util2 = analyzeStructure(view2).reveal;
   check('拾取后效能重算正常(账目规模一致)',
     util2.count.size === view2.perceived.length
     && result2.occludesOf.get(maxHolders[0].tileId) === undefined);

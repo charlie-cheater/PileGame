@@ -17,7 +17,7 @@ import { Board } from '../core/Board';
 import { TILE, ElementDef } from '../core/tile';
 import { PileView } from '../view/PileView';
 import { perceive, UNKNOWN_ELEMENT } from './Perception';
-import { analyze } from './Analysis';
+import { analyze, analyzeStructure } from './Analysis';
 
 export interface AgentDebugOptions {
   /** 静态叠加层(牌边框/深度角标/遮挡关系线/隐藏幽灵/统计行)。
@@ -30,9 +30,11 @@ export interface AgentDebugOptions {
 /** 在 PileView 节点上挂接代理 debug 覆盖层(一次性,静态盘面审阅) */
 export function attachAgentDebug(pile: PileView, board: Board, opts: AgentDebugOptions): void {
   // ── 代理管线:①感知 → ②分析(分析结果保持纯主观;真值对照由本层就地取 board)──
+  // 遮挡边 / 深度 / 揭露效能是③决策不读的数据,不随 analyze 计算,面板按需另取
   const view = perceive(board);
   const result = analyze(view);
-  const util = result.reveal;
+  const extras = analyzeStructure(view);
+  const util = extras.reveal;
   // 独占遮挡按遮挡者分组(direct 字段已移除,由 exclusivePairs 重建)
   const directOf = new Map<number, number[]>();
   for (const p of util.exclusivePairs) {
@@ -127,13 +129,13 @@ export function attachAgentDebug(pile: PileView, board: Board, opts: AgentDebugO
 
       const masked = t.elementId === UNKNOWN_ELEMENT;
       if (masked) maskedCount++;
-      const depth = result.depth.depth.get(t.tileId) ?? 0;
+      const depth = extras.depth.depth.get(t.tileId) ?? 0;
       mkLabel(c.x + w / 2 - 26, c.y - h / 2 + 24,
         (masked ? '?d' : 'd') + depth, 24, masked ? DEPTH_MASKED : DEPTH_KNOWN);
     }
 
     // 遮挡边(感知子集内;橙 = 跨层,蓝 = 同层,终点圆点 = 被遮挡方)
-    for (const e of result.edges) {
+    for (const e of extras.edges) {
       const a = byId.get(e.above);
       const b = byId.get(e.below);
       if (!a || !b) continue;
@@ -155,7 +157,7 @@ export function attachAgentDebug(pile: PileView, board: Board, opts: AgentDebugO
     // 统计行
     mkLabel(0, bottomY,
       `代理感知 ${view.perceived.length}/${view.totalPileCount} 张 · 未识别 ${maskedCount} · `
-      + `可点 ${clickableCount} · 遮挡边 ${result.edges.length} · maxDepth ${result.depth.maxDepth} · `
+      + `可点 ${clickableCount} · 遮挡边 ${extras.edges.length} · maxDepth ${extras.depth.maxDepth} · `
       + `可点冲突 ${conflictCount}`,
       26, new Color(255, 240, 200, 255));
   }

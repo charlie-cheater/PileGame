@@ -16,41 +16,51 @@
 // 优先级裁定(2026-11-23,与设计稿表格的偏差及依据):
 //   slot-close 先于 pair-complete——设计稿原列 pair-complete 居先,但
 //   平盘推演证伪:pair-complete 先行会连续持半(E1a→E2a→E3a→E4a)槽满
-//   判负;slot-close 先行则逐对闭合清盘。tests/agent-decision.test.js
-//   以逆序梯实证此裁定。
+//   判负;slot-close 先行则逐对闭合清盘。2026-11-24 起 pair-complete 只收
+//   可执行的 double(空槽 < 2 让位),连续持半致判负的情形已被门槛排除;
+//   先后顺序仍影响槽压峰值(先闭合再开对,峰值更低)。
 //
-// 梯序(休闲基线 defaultLadder):slot-close → pair-complete → chain → wander
-//   (cheap-hold / dig / forced 待实现)。chain 居 pair-complete 之后:闭对的
-//   每一步都看得见,只比双亮对多一步(2026-11-23 裁定)。
+// 梯序(休闲基线 defaultLadder):slot-close → pair-complete → dig → explore
+//   四梯的候选来源统一为 MatchReport 的三类匹配 + 兜底:slot-close 收 close 型,
+//   pair-complete 收可执行 double 型,dig 收其余可执行匹配(hold / dig 型),
+//   explore 接手「无可执行匹配」的局面(不收匹配,按揭露量与自身风险选牌)。
+//   wander(均匀随机)保留为对照基线,不在默认梯。
+//   原 chain 梯(借槽两步闭合,2026-11-23)已于 2026-11-24 整体移除:其两类机会
+//   在 MatchReport 中均为可执行的 hold 型匹配,由 dig 梯覆盖。
 //
-// 人类可信度边界:单遍扫描不回溯;梯内效用 = 分析数据一跳可达
-//   (效用打分属 Step 2);expectation 只预测「下一步感知可验证」的字段。
+// 择优依据(2026-11-24 设计定论):梯内择优统一用「拾取差分」的字典序
+//   (新增可执行匹配 > 类型升级 > 峰值下降总量);原揭示预演两路求和
+//   (0.7 × Σ激活 + 0.3 × near)仅服务于 chain 梯,随其移除而退场。
+//
+// 人类可信度边界:单遍扫描不回溯;expectation 只预测「下一步感知可验证」的字段。
 // ============================================================================
 
 import { Tile } from '../core/tile';
-import { SLOT_COUNT } from '../core/Board';
 import { SubjectiveView, UNKNOWN_ELEMENT } from './Perception';
-import { analyze, AnalysisResult, ChainKind, IdentifiedTileRecord, MatchOpportunity, MatchType, RevealForecast, simulateReveal } from './Analysis';
+import { analyze, AnalysisResult, MatchOpportunity, MatchType, RevealForecast, simulateReveal } from './Analysis';
 
 // ─────────────────────────── 契约类型 ───────────────────────────
 
 /** 思考模式(扫描梯的梯名;fallback = 内置安全网,非可插拔梯) */
 export type DecisionRule =
-  | 'slot-close'     // 闭合槽内半张
-  | 'pair-complete'  // 双亮对折叠(P2)
-  | 'chain'          // 借槽两步闭合(slot / pair 两类)
-  | 'cheap-hold'     // 持半(Step 2)
-  | 'dig'            // 挖掘(Step 2)
-  | 'forced'         // 被迫(Step 2)
-  | 'wander'         // 无信号显著度随机
+  | 'slot-close'     // 闭合槽内半张(close 型匹配)
+  | 'pair-complete'  // 双亮对折叠(P2;可执行 double 型匹配)
+  | 'dig'            // 启动需挖掘的匹配(可执行 hold / dig 型匹配)
+  | 'explore'        // 寻找新的潜在可能性(无可执行匹配时,按揭露量买信息)
+  | 'wander'         // 均匀随机(对照基线,不在默认梯)
   | 'fallback';      // 内置兜底
 
-/** 借槽两步闭合的一条链路(③→⑤ 对账面:下一步拿 tileId 即应闭对) */
-export interface ChainLink {
-  /** 揭出后下一步拿走即可闭对的牌 */
-  tileId: number;
-  /** 与谁闭合:slot = 槽内已有的半张;pair = 本次拿的这张 */
-  kind: ChainKind;
+/** dig 梯所选中的匹配(结构化引用,随操作落盘) */
+export interface ChosenMatch {
+  elementId: string;
+  /** 匹配类型(hold / dig) */
+  type: MatchType;
+  /** 启动牌 */
+  launcher: number;
+  /** 目标牌 */
+  target: number;
+  /** 消耗 = 消除模拟的净占用峰值(槽位格数) */
+  matchCost: number;
 }
 
 /** 一次拾取前后分析数据的差异(2026-11-24 设计定论:决策只产生「拾取一张牌」,
@@ -81,8 +91,8 @@ export interface OperationReason {
   utility?: number;
   /** 梯内次优候选(效用差 = 猩豫度原料) */
   runnerUp?: { tileId: number; score: number };
-  /** chain 梯专用:本次拿牌揭出、下一步即可闭对的牌及其分类(可多条) */
-  chain?: ChainLink[];
+  /** dig 梯专用:本次启动的匹配 */
+  match?: ChosenMatch;
   /** 拾取差分(2026-11-24 起,择优改用差分的梯随操作落盘;含三级分量与明细) */
   delta?: PickDelta;
 }
@@ -115,7 +125,8 @@ export interface OperationTrace {
   note?: string;
   utility?: number;
   runnerUp?: { tileId: number; score: number };
-  chain?: ChainLink[];
+  /** dig 梯所选中的匹配 */
+  match?: ChosenMatch;
   /** 拾取差分(择优改用差分的梯) */
   delta?: PickDelta;
   expectation: OperationExpectation;
@@ -187,82 +198,22 @@ function randomPickOp(rule: DecisionRule, ctx: LadderContext): AgentOperation {
   };
 }
 
-// ─────────────────────────── 梯内平级择优(效能打分) ───────────────────────────
-
-/**
- * 同梯多候选择优(2026-11-23 用户指示):用分析数据为每个候选构建效能,
- * 取最大;平分取 tileId 较小者(确定性,不耗 rng)。
- *
- * 效能 = 揭示预演(simulateReveal)的两路求和,2026-11-23 裁定口径:
- *   · activation(高权重 0.7):预演后变可点的直接目标,逐张计激活值
- *     closes 1.0(伴在槽)/ pairs 0.8(另有已识别牌同批或当前可点)/ lone 0.2
- *     ——**求和不归一**:揭 3 张优势牌好过 2 张(布局规则下单次揭露 ≤ 4 张)
- *   · near(低权重 0.3):预演后仍被压的直接目标里,「剩余遮挡者有可点牌」
- *     (再拿一张即可点)的张数——轮次口径,与激活值同为求和
- *   · 权重只比值有意义:一张优势牌 ≈ 2.3 张「再拿一张就可点」的被压牌
- *
- * 已移除项(口径不干净或设计意图待定):
- *   · revealArea / depthGain —— 像素口径的量回答轮次口径的问题;由预演替代
- *   · hardness —— 设计意图待分析,暂不计分
- */
-const EFF_WEIGHTS = { activation: 0.7, near: 0.3 } as const;
-
-export interface PickEfficiency {
-  /** Σ 激活值(closes 1.0 / pairs 0.8 / lone 0.2) */
-  activationSum: number;
-  /** near 张数 */
-  nearCount: number;
-  /** 加权总分 = 0.7·activationSum + 0.3·nearCount */
-  score: number;
-}
-
-/** 预演报告 → 效能(两路求和;候选已持有 forecast 时直接调用,免重算) */
-export function scoreOfForecast(f: RevealForecast): PickEfficiency {
-  return {
-    activationSum: f.activationSum,
-    nearCount: f.nearCount,
-    score: EFF_WEIGHTS.activation * f.activationSum + EFF_WEIGHTS.near * f.nearCount,
-  };
-}
-
-/** 单个候选拾取的效能评估(揭示预演 → 加权求和) */
-export function scorePick(tileId: number, ctx: LadderContext): PickEfficiency {
-  return scoreOfForecast(simulateReveal(tileId, ctx.view, ctx.analysis));
-}
-
-/** 候选集内取效能最大者(平分取 id 小者;顺带记录次优供犹豫度) */
-function pickBest<T>(
-  candidates: ReadonlyArray<T>,
-  idOf: (t: T) => number,
-  score: (t: T) => PickEfficiency,
-): { pick: T; eff: PickEfficiency; runnerUp?: { tileId: number; score: number } } {
-  let best: T | null = null;
-  let bestEff: PickEfficiency | null = null;
-  let bestId = 0;
-  let runnerUp: { tileId: number; score: number } | undefined;
-  for (const c of candidates) {
-    const e = score(c);
-    const id = idOf(c);
-    if (!best || e.score > bestEff!.score
-        || (e.score === bestEff!.score && id < bestId)) {
-      if (best) runnerUp = { tileId: bestId, score: bestEff!.score };
-      best = c;
-      bestEff = e;
-      bestId = id;
-    } else if (!runnerUp || e.score > runnerUp.score) {
-      runnerUp = { tileId: id, score: e.score };
-    }
-  }
-  return { pick: best!, eff: bestEff!, runnerUp };
-}
-
 // ─────────────────────────── 梯内平级择优(拾取差分,字典序) ───────────────────────────
 
 /** 匹配的可达性等级(字典序第二级「类型升级」的度量:数值上升 = 升级) */
 const REACH_RANK: Record<MatchType, number> = { dig: 0, hold: 1, double: 2, close: 3 };
 
-/** 匹配的身份:同一配对在拾取前后用 (launcher, target) 这对牌标识 */
-const matchKey = (o: MatchOpportunity): string => `${o.launcher.tileId}/${o.target.tileId}`;
+/** 匹配的身份:同一配对在拾取前后用其两张牌标识。**与角色无关**——按 tileId
+ *  升序记:launcher / target 互换仍是同一匹配(例:double 的 target 被拿走后
+ *  入槽、成本变 0,在新一轮分析里成为 launcher)。若按 (launcher, target) 记,
+ *  角色互换会被算成「消失一个 + 新出现一个」:同一对牌因拿的是哪一张而得到
+ *  不同的差分(2026-11-24 改造 pair-complete 时发现并修正——该梯对同一匹配的
+ *  两张牌各预演一次,身份必须与角色无关,比较才有意义) */
+const matchKey = (o: MatchOpportunity): string => {
+  const a = Math.min(o.launcher.tileId, o.target.tileId);
+  const b = Math.max(o.launcher.tileId, o.target.tileId);
+  return `${a}/${b}`;
+};
 
 /** 新出现的匹配里,属于 close / double 型(可直接闭合)的计入「升级」 */
 function isNewlyCloseLike(o: MatchOpportunity): boolean {
@@ -441,108 +392,161 @@ export const slotCloseRung: DecisionRung = {
   },
 };
 
-/** 梯 2 pair-complete:双亮对(P2 折叠);元素内选较优半张,跨元素效能取最大 */
+/** 梯 2 pair-complete:双亮对(P2 折叠)——拿可执行 double 型匹配中的一张。
+ *  候选来源 = MatchReport 中**可执行**的 double 型匹配(2026-11-24 改造,流程同
+ *  slot-close)。可执行即峰值 ≤ 空槽:double 的峰值为 2,故空槽 < 2 时整梯让位——
+ *  不拿一张闭不了的半张去占最后的空槽。
+ *  与 slot-close 的最大不同:每个匹配有**两张**可点的牌(launcher 与 target),
+ *  拿哪张都能成对,但各自揭出的东西不同——故对两张牌**各做一次**拾取差分预演,
+ *  一并参与择优。
+ *  择优 = 拾取差分的字典序(同 slot-close):新增可执行匹配数 > 类型升级数 >
+ *  保留匹配的峰值下降总量;平分取 tileId 小者。进槽成本不计 */
 export const pairCompleteRung: DecisionRung = {
   rule: 'pair-complete',
   decide(ctx) {
-    let best: { mate: IdentifiedTileRecord; partner: number; eff: PickEfficiency;
-                runnerUp?: { tileId: number; score: number } } | null = null;
-    ctx.analysis.groups.groups.forEach(g => {
-      const lit = g.pile.filter(r => r.clickable);
-      if (lit.length < 2) return;
-      // 元素内:两张同元素可互换,选预演效能较优的半张持走
-      const inner = pickBest(lit, t => t.tileId, t => scorePick(t.tileId, ctx));
-      const partner = lit.find(r => r.tileId !== inner.pick.tileId)!.tileId;
-      if (!best) {
-        best = { mate: inner.pick, partner, eff: inner.eff };
-      } else if (inner.eff.score > best.eff.score
-          || (inner.eff.score === best.eff.score && inner.pick.tileId < best.mate.tileId)) {
-        best = { mate: inner.pick, partner, eff: inner.eff,
-                 runnerUp: { tileId: best.mate.tileId, score: best.eff.score } };
-      } else if (!best.runnerUp || inner.eff.score > best.runnerUp.score) {
-        best.runnerUp = { tileId: inner.pick.tileId, score: inner.eff.score };
-      }
-    });
-    if (!best) return null;
+    const matches = ctx.analysis.matches.opportunities.filter(
+      o => o.type === 'double' && o.executable);
+    if (matches.length === 0) return null;
 
-    const fmt = (n: number): string => n.toFixed(2);
-    return {
-      action: { type: 'pick', tileId: best.mate.tileId },
-      reason: {
-        rule: this.rule,
-        note: `双亮对:持 tileId ${best.mate.tileId}(伴 ${best.partner} 可点,P2 折叠)`
-          + ` · 效能 ${fmt(best.eff.score)}`
-          + `(激活 ${fmt(best.eff.activationSum)}/近点 ${best.eff.nearCount})`
-          + (best.runnerUp ? ` · 次优 ${fmt(best.runnerUp.score)}` : ''),
-        utility: best.eff.score,
-        runnerUp: best.runnerUp,
-      },
-      expectation: expectForPick(best.mate.tileId, ctx),
-    };
-  },
-};
-
-/** chain 梯的空槽门槛:本次拿的牌入槽占 1 格,揭出的伴再入 1 格才触发闭对 */
-const CHAIN_MIN_EMPTY_SLOTS = 2;
-
-/** chain 梯内 pair 类链路的加分(2026-11-23 用户裁定「槽位干净更重要」):
- *  pair 链闭对后两张一起离场,不新接手半张;slot 链则把槽里原来等的半张
- *  换成本次拿的这张(两步后槽内张数相同,手里等的那张换了)。加分表达
- *  「不愿接手新的半张」。取值 = near 权重 0.3(系统里既有的低权单位):
- *    一条 pair 链 = 1.0 —— 胜 slot 链多揭 1~2 张散牌(0.84 / 0.98),
- *    与 slot 链多 1 张近点(1.0)同分(按 tileId),
- *    不敌 slot 链多揭 1 张 pairs 牌(1.26)。
- *  按条计(一条 pair 链路加一次) */
-const CHAIN_PAIR_BONUS = 0.3;
-
-/** 梯 3 chain:借槽两步闭合——拿一张可点牌,它揭出的牌下一步拿走即可闭对。
- *  两类同梯、按效能取最大(2026-11-23 用户裁定):slot = 揭出的牌与槽内已有
- *  半张闭合;pair = 揭出的牌与本次拿的这张闭合(另计加分 CHAIN_PAIR_BONUS)。
- *  预演深度 2,不继续往下预演。
- *  可用性是开关而非打分项:空槽 < 2 时整梯让位(按当前容量计——槽位扩充
- *  道具下表达式不变,自动适应)。本梯假定 slot-close / pair-complete 已让位。 */
-export const chainRung: DecisionRung = {
-  rule: 'chain',
-  decide(ctx) {
-    if (SLOT_COUNT - ctx.view.slot.length < CHAIN_MIN_EMPTY_SLOTS) return null;
-    const candidates: Array<{ tile: Tile; links: ChainLink[]; eff: PickEfficiency;
-                             pairLinks: number }> = [];
-    for (const t of ctx.clickable) {
-      const f = simulateReveal(t.tileId, ctx.view, ctx.analysis);
-      const links: ChainLink[] = [];
-      for (const c of f.clickable) {
-        if (c.chain !== null) links.push({ tileId: c.tileId, kind: c.chain });
-      }
-      if (links.length === 0) continue;
-      const eff = scoreOfForecast(f);
-      const pairLinks = links.filter(l => l.kind === 'pair').length;
-      eff.score += CHAIN_PAIR_BONUS * pairLinks;
-      candidates.push({ tile: t, links, eff, pairLinks });
+    // 每个匹配的两张牌各预演一次
+    const candidates: Array<{ match: MatchOpportunity; tileId: number }> = [];
+    for (const m of matches) {
+      candidates.push({ match: m, tileId: m.launcher.tileId });
+      candidates.push({ match: m, tileId: m.target.tileId });
     }
-    if (candidates.length === 0) return null;
 
-    const { pick, eff, runnerUp } = pickBest(
-      candidates, c => c.tile.tileId, c => c.eff);
-    const fmt = (n: number): string => n.toFixed(2);
+    const { pick, delta, runnerUp } = pickBestByDelta(
+      candidates, c => c.tileId, c => pickDelta(c.tileId, ctx));
+    const other = pick.tileId === pick.match.launcher.tileId
+      ? pick.match.target.tileId : pick.match.launcher.tileId;
     return {
-      action: { type: 'pick', tileId: pick.tile.tileId },
+      action: { type: 'pick', tileId: pick.tileId },
       reason: {
         rule: this.rule,
-        note: `借槽两步闭合:${pick.links.map(l => `${l.kind}→${l.tileId}`).join('、')}`
-          + ` · 效能 ${fmt(eff.score)}(激活 ${fmt(eff.activationSum)}/近点 ${eff.nearCount}`
-          + (pick.pairLinks > 0 ? `/pair 加分 ${fmt(CHAIN_PAIR_BONUS * pick.pairLinks)}` : '')
-          + `)`
-          + (runnerUp ? ` · 次优 ${fmt(runnerUp.score)}` : ''),
-        utility: eff.score,
-        runnerUp,
-        chain: pick.links,
+        note: `双亮对 ${pick.match.elementId}:持 tileId ${pick.tileId}(伴 ${other} 可点,P2 折叠)`
+          + ` · 差分 新增可执行 ${delta.newExecutable} / 升级 ${delta.upgrades} / 峰值降 ${delta.peakDrop}`
+          + (runnerUp ? ` · 次优 ${runnerUp.tileId}(可执行 ${runnerUp.delta.newExecutable} / 升级 ${runnerUp.delta.upgrades} / 降 ${runnerUp.delta.peakDrop})` : '')
+          + ` · 消耗 ${pick.match.matchCost}/${ctx.analysis.matches.emptySlots} 格`,
+        utility: deltaScore(delta),
+        runnerUp: runnerUp ? { tileId: runnerUp.tileId, score: deltaScore(runnerUp.delta) } : undefined,
+        delta,
       },
-      expectation: expectForPick(pick.tile.tileId, ctx),
+      expectation: expectForPick(pick.tileId, ctx),
     };
   },
 };
 
-/** 梯 4 wander:无任何配对信号时的随机(骨架级均匀;显著度加权待人格批) */
+/** dig 梯的候选选择:除 close / double 外的**可执行**匹配(即 hold / dig 型;
+ *  可执行 = 峰值 ≤ 空槽数)。close 型归 slot-close,double 型归 pair-complete。
+ *
+ *  匹配间的排序(2026-11-24 定稿):槽内遗留最少 → 同遗留按消耗升序 → elementId。
+ *  「遗留」= 该匹配消除模拟结束时卡在槽里的牌(`cost.residual`)——遗留少的匹配
+ *  走完后盘面更干净。批量实证(各 100 局,同种子):14 元素档通关率 70%(对照
+ *  占位消耗升序 63%、拾取差分 73%——差值在噪声边缘,且差分需对每个候选重新
+ *  分析,不值),7 元素档峰值槽压 2.18(全场最低);23 / 35 元素档排序不敏感。 */
+export function selectDigMatch(ctx: LadderContext): MatchOpportunity | null {
+  const cands = ctx.analysis.matches.opportunities.filter(
+    o => (o.type === 'hold' || o.type === 'dig') && o.executable && o.cost.picks.length > 0);
+  if (cands.length === 0) return null;
+  return cands.slice().sort((a, b) =>
+    a.cost.residual.length - b.cost.residual.length
+    || a.matchCost - b.matchCost
+    || byElementId(a, b))[0];
+}
+
+/** 按 elementId 升序(排序的最终决胜键) */
+function byElementId(a: MatchOpportunity, b: MatchOpportunity): number {
+  return a.elementId < b.elementId ? -1 : 1;
+}
+
+/** 梯 3 dig:启动一个需要挖掘的匹配。
+ *  候选 = selectDigMatch(可执行的 hold / dig 型)。
+ *  动作 = 该匹配消除模拟计划的**第一次拾取**(MatchCostBreakdown.picks)。
+ *  可执行性正是针对这套拿牌顺序得出的(先挖启动牌、再挖目标牌;能立即闭对
+ *  的遮挡者优先),照此执行才能兑现「峰值 ≤ 空槽」。
+ *  2026-11-24 取代原 chain 梯:借槽两步闭合的两类机会在此均为可执行的
+ *  hold 型匹配(峰值 2),由本梯覆盖。 */
+export const digRung: DecisionRung = {
+  rule: 'dig',
+  decide(ctx) {
+    const m = selectDigMatch(ctx);
+    if (!m) return null;
+    const tileId = m.cost.picks[0];
+    return {
+      action: { type: 'pick', tileId },
+      reason: {
+        rule: this.rule,
+        note: `启动匹配 ${m.elementId}(${m.type}):拿 tileId ${tileId}`
+          + ` · 消耗 ${m.matchCost}/${ctx.analysis.matches.emptySlots} 格`
+          + ` · 计划 ${m.cost.picks.length} 步`,
+        match: {
+          elementId: m.elementId, type: m.type,
+          launcher: m.launcher.tileId, target: m.target.tileId,
+          matchCost: m.matchCost,
+        },
+      },
+      expectation: expectForPick(tileId, ctx),
+    };
+  },
+};
+
+/** 梯 4 explore:寻找新的潜在可能性(2026-11-24 设计裁定)。
+ *  接手时盘上已无任何可执行的匹配:空槽通常只剩 1~2 格,可点的牌没有一张能
+ *  立刻缩小槽位占用。既然这一拿缩不了占用,就让它**尽可能多地买信息**——
+ *  揭示预演只在当前感知集上进行,新露出的牌进入感知后,下一轮分析才可能
+ *  出现新的可执行匹配。
+ *  候选 = 全部主观可点牌。择优 = 字典序:**揭露量 > 自身风险**;平分取 tileId 小者。
+ *   · 揭露量 = 揭示预演的 Σ激活值(closes 1.0 / pairs 0.8 / lone 0.2)——拿走这张
+ *     后其直接覆盖的牌里有多少变可点、能否配对(揭示预演报告现成的 activationSum)
+ *   · 自身风险 = 拿的这张入槽后,其伴是否主观可见(已识别且在感知集或槽内):
+ *     可见 = 低风险(这张半张等得到伴);不可见 / 身份未识别 = 高风险
+ *  「可能命中槽内半张」的推断未采用(设计者裁定,2026-11-24)。
+ *  仅此一梯:空槽 1 时的必败局面不单独处理(届时任何拿法都是最后一步,
+ *  同一评分退化为只看揭露量)。 */
+export const exploreRung: DecisionRung = {
+  rule: 'explore',
+  decide(ctx) {
+    if (ctx.clickable.length === 0) return null;
+    let best: { tile: Tile; reveal: number; risky: number } | null = null;
+    for (const t of ctx.clickable) {
+      const forecast = simulateReveal(t.tileId, ctx.view, ctx.analysis);
+      const c = {
+        tile: t,
+        reveal: forecast.activationSum,
+        risky: exploreSelfRisk(t.tileId, ctx),
+      };
+      if (!best
+          || c.reveal > best.reveal
+          || (c.reveal === best.reveal && c.risky < best.risky)
+          || (c.reveal === best.reveal && c.risky === best.risky && c.tile.tileId < best.tile.tileId)) {
+        best = c;
+      }
+    }
+    return {
+      action: { type: 'pick', tileId: best!.tile.tileId },
+      reason: {
+        rule: this.rule,
+        note: `探索:拿 tileId ${best!.tile.tileId}`
+          + ` · 揭露 ${best!.reveal.toFixed(1)} · 自身${best!.risky === 0 ? '低风险(伴可见)' : '高风险(伴不可见)'}`,
+      },
+      expectation: expectForPick(best!.tile.tileId, ctx),
+    };
+  },
+};
+
+/** explore 的自身风险:所拿的牌入槽后其伴是否主观可见(0 = 可见,低风险;1 = 不可见)。
+ *  伴可见 ⇔ 身份已识别,且同元素在槽内或感知集里还有别的牌 */
+function exploreSelfRisk(tileId: number, ctx: LadderContext): number {
+  const t = ctx.view.perceived.find(p => p.tileId === tileId);
+  if (!t || t.elementId === UNKNOWN_ELEMENT) return 1;
+  const g = ctx.analysis.groups.groups.get(t.elementId);
+  if (!g) return 1;
+  const others = g.slot.length + g.pile.filter(r => r.tileId !== tileId).length;
+  return others > 0 ? 0 : 1;
+}
+
+/** wander:均匀随机(骨架级)。**不再是默认梯的一员**——2026-11-24 起由 explore
+ *  取代;保留作随机对照基线(实验时替换末梯即可) */
 export const wanderRung: DecisionRung = {
   rule: 'wander',
   decide(ctx) {
@@ -554,15 +558,16 @@ export const wanderRung: DecisionRung = {
 export const defaultLadder: ReadonlyArray<DecisionRung> = [
   slotCloseRung,
   pairCompleteRung,
-  chainRung,
-  wanderRung,
+  digRung,
+  exploreRung,
 ];
 
 // ─────────────────────────── 瀑布执行 ───────────────────────────
 
 /**
  * 瀑布:依序过梯,首个非空胜出;全空 → 内置 fallback(均匀随机安全网,
- * 正常配梯后罕触发——wander 梯在位时它只接住「梯配错了」的情况)。
+ * 正常配梯后罕触发——explore 梯只要有可点牌就会出手,它只接住「无可点牌」
+ * 与「梯配错了」的情况)。
  */
 export function decideByLadder(
   rungs: ReadonlyArray<DecisionRung>,

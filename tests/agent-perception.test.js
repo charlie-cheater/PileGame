@@ -7,6 +7,7 @@
 // 编译(纯逻辑文件,无 cc 依赖):
 //   npx -y -p typescript@5.4.5 tsc assets/scripts/core/*.ts \
 //     assets/scripts/agent/Perception.ts assets/scripts/agent/Analysis.ts \
+//     assets/scripts/agent/Ladder.ts \
 //     --rootDir assets/scripts --outDir temp/v3check \
 //     --module commonjs --target es2019 --skipLibCheck --esModuleInterop
 //   node tests/agent-perception.test.js
@@ -15,11 +16,13 @@
 const LAYOUT = require('../assets/data/layouts/test_layout.json');
 const { Board } = require('../temp/v3check/core/Board');
 const { computeDepths } = require('../temp/v3check/core/Depth');
-const { coversAny } = require('../temp/v3check/core/Occlusion');
+const { coversAny, computeOcclusion } = require('../temp/v3check/core/Occlusion');
 const { fillSlots } = require('../temp/v3check/core/RandomFill');
 const { buildMahjongElements } = require('../temp/v3check/core/MahjongSet');
+const { lcg } = require('../temp/v3check/core/LevelBuilder');
 const { perceive, UNKNOWN_ELEMENT } = require('../temp/v3check/agent/Perception');
-const { analyze } = require('../temp/v3check/agent/Analysis');
+const { analyze, simulateReveal } = require('../temp/v3check/agent/Analysis');
+const { decideByLadder, defaultLadder } = require('../temp/v3check/agent/Ladder');
 
 let pass = 0, fail = 0;
 function check(name, cond, detail) {
@@ -507,6 +510,197 @@ console.log('— 分析扩展:匹配消耗 v4(消除模拟的净占用峰值)—
     + ` · 峰值 最小 ${Math.min(...peaks)} / 均值 ${(peaks.reduce((s, x) => s + x, 0) / peaks.length).toFixed(2)}`
     + ` / 最大 ${Math.max(...peaks)} · 可执行 ${exec}/${r2.opportunities.length}`
     + ` · 最廉 ${cheapest.elementId}(${cheapest.matchCost} 格)`);
+}
+
+// ============================================================================
+// 结果层等价性回归(2026-11-24,消除模拟提速·方案甲)
+// 规则层已证明「单张牌的被压判定」与全盘重算等价(见 occlusion-v3.test.js);
+// 这里证明「整个模拟跑下来的结果」也没变:在真实对局的每一步,用下面按原文
+// 保留的旧实现(每拿一张牌就全盘重算一次)重跑报告里的每一条匹配,
+// 逐字段比较全部产出。
+// ============================================================================
+
+console.log('— 结果层等价性回归:新模拟 ⇔ 旧的逐步全盘重算 —');
+{
+  /** 旧版消除模拟:2026-11-24 之前 Analysis.ts 里的实现,逐字移植。
+   *  作为参照保留,勿随主代码改动。 */
+  function legacySimulateMatch(view, launcherId, targetId, region, closureOf) {
+    const elemOf = new Map();
+    for (const t of view.perceived) elemOf.set(t.tileId, t.elementId);
+    for (const s of view.slot) elemOf.set(s.tileId, s.elementId);
+
+    const removed = new Set();
+    const slot = [];
+    const preexisting = [];
+    for (const s of view.slot) { slot.push(s.tileId); preexisting.push(s.tileId); }
+    const base = slot.length;
+
+    const occupancy = [];
+    const residual = [];
+    const picks = [];
+    let peak = 0;
+    let steps = 0;
+
+    const clickableNow = () => {
+      const hypo = view.perceived.filter(t => !removed.has(t.tileId));
+      const derived = computeOcclusion(hypo);
+      const ids = [];
+      for (const t of hypo) {
+        if (derived.get(t.tileId)?.clickable === true) ids.push(t.tileId);
+      }
+      return ids.sort((a, b) => a - b);
+    };
+    const settle = () => {
+      let paired = true;
+      while (paired) {
+        paired = false;
+        outer: for (let i = 0; i < slot.length; i++) {
+          const e = elemOf.get(slot[i]);
+          if (e === undefined || e === UNKNOWN_ELEMENT) continue;
+          for (let j = i + 1; j < slot.length; j++) {
+            if (elemOf.get(slot[j]) === e) {
+              slot.splice(j, 1);
+              slot.splice(i, 1);
+              paired = true;
+              break outer;
+            }
+          }
+        }
+      }
+    };
+    const onPile = (id) => !removed.has(id) && !slot.some(x => x === id);
+    const take = (id) => {
+      if (!onPile(id)) return;
+      removed.add(id);
+      picks.push(id);
+      slot.push(id);
+      const net = slot.length - base;
+      occupancy.push(net);
+      if (net > peak) peak = net;
+      settle();
+      steps++;
+    };
+
+    const regionSet = new Set(region);
+    const digAndTake = (goal) => {
+      const own = new Set(closureOf(goal));
+      let guard = 0;
+      while (!removed.has(goal) && guard++ < view.perceived.length + 4) {
+        const click = clickableNow();
+        if (click.some(id => id === goal)) { take(goal); return; }
+        const cands = click.filter(id => own.has(id) && regionSet.has(id) && onPile(id));
+        if (cands.length === 0) break;
+        const slotElems = new Set(slot.map(id => elemOf.get(id)));
+        const closing = cands.filter(id => slotElems.has(elemOf.get(id)));
+        take((closing.length > 0 ? closing : cands)[0]);
+      }
+    };
+
+    if (!preexisting.some(id => id === launcherId)) digAndTake(launcherId);
+    digAndTake(targetId);
+
+    let acted = true;
+    let guard = 0;
+    while (acted && guard++ < view.perceived.length + 4) {
+      acted = false;
+      const click = clickableNow();
+      for (let i = 0; i < slot.length; i++) {
+        const x = slot[i];
+        const e = elemOf.get(x);
+        if (e === undefined || e === UNKNOWN_ELEMENT) continue;
+        const mate = click.find(id => onPile(id) && elemOf.get(id) === e);
+        if (mate !== undefined) { take(mate); acted = true; break; }
+      }
+    }
+
+    for (const id of slot) residual.push(id);
+    return { peak, preexisting, occupancy, residual, steps, picks };
+  }
+
+  /** 闭包成员(与旧实现所用相同:沿 blockersOf 的传递闭包,tileId 升序) */
+  const closureIndexOf = (analysis) => {
+    const memo = new Map();
+    return (id) => {
+      const hit = memo.get(id);
+      if (hit) return hit;
+      const set = new Set();
+      const walk = (x) => {
+        for (const b of analysis.blockersOf.get(x) ?? []) {
+          if (!set.has(b)) { set.add(b); walk(b); }
+        }
+      };
+      walk(id);
+      const arr = [...set].sort((a, b) => a - b);
+      memo.set(id, arr);
+      return arr;
+    };
+  };
+
+  const mkEls = n => Array.from({ length: n }, (_, i) => ({ elementId: 'u' + (i + 1), displayName: 'e', color: '#fff' }));
+  const S = { steps: 0, entries: 0, simSteps: 0, withResidual: 0, launcherInSlot: 0, badSim: 0, firstBad: '',
+    reveals: 0, badReveal: 0, minTiles: Infinity, maxTiles: 0 };
+  // 用默认梯跑真实对局(覆盖开局到残局;7/14/35 元素各取数局)
+  for (const [n, games] of [[7, 3], [14, 2], [35, 1]]) {
+    for (let g = 0; g < games; g++) {
+      const els = mkEls(n);
+      const b = new Board({ board: LAYOUT.board, elements: els, tiles: fillSlots(LAYOUT.tiles, { elements: els, seed: 1000 + g }) });
+      for (let step = 0; step < 300; step++) {
+        if (b.isCleared()) break;
+        const view = perceive(b);
+        if (view.perceived.length === 0) break;
+        const a = analyze(view);
+        const click = view.perceived.filter(t => a.derived.get(t.tileId).clickable);
+        if (click.length === 0) break;
+        S.steps++; S.minTiles = Math.min(S.minTiles, view.perceived.length); S.maxTiles = Math.max(S.maxTiles, view.perceived.length);
+
+        // ① 每条匹配:用旧模拟重跑,比较全部产出
+        const closureOf = closureIndexOf(a);
+        for (const o of a.matches.opportunities) {
+          S.entries++; S.simSteps += o.cost.steps;
+          if (o.cost.residual.length > 0) S.withResidual++;
+          if (o.launcher.inSlot) S.launcherInSlot++;
+          const ref = legacySimulateMatch(view, o.launcher.tileId, o.target.tileId, o.cost.region, closureOf);
+          const same = ref.peak === o.matchCost
+            && JSON.stringify(ref.preexisting) === JSON.stringify(o.cost.preexisting)
+            && JSON.stringify(ref.occupancy) === JSON.stringify(o.cost.occupancy)
+            && JSON.stringify(ref.residual) === JSON.stringify(o.cost.residual)
+            && ref.steps === o.cost.steps
+            && JSON.stringify(ref.picks) === JSON.stringify(o.cost.picks);
+          if (!same) {
+            S.badSim++;
+            if (!S.firstBad) S.firstBad = `${o.elementId} ${o.type}: 峰值 ${ref.peak}/${o.matchCost} 占用 ${ref.occupancy}/${o.cost.occupancy} `
+              + `剩余 ${ref.residual}/${o.cost.residual} 计划 ${ref.picks}/${o.cost.picks}`;
+          }
+        }
+
+        // ② 揭示预演:拿走每张可点牌后「哪些直接目标变可点」——旧法在假设集合上全盘重算
+        const picksToTest = click.length <= 4 ? click : [click[0], click[1], click[click.length - 2], click[click.length - 1]];
+        for (const c of picksToTest) {
+          S.reveals++;
+          const hypo = view.perceived.filter(t => t.tileId !== c.tileId);
+          const d = computeOcclusion(hypo);
+          const expect = (a.occludesOf.get(c.tileId) ?? [])
+            .filter(t => a.derived.get(t)?.clickable !== true && d.get(t)?.clickable === true)
+            .sort((x, y) => x - y);
+          const got = simulateReveal(c.tileId, view, a).clickable.map(x => x.tileId);
+          if (JSON.stringify(expect) !== JSON.stringify(got)) S.badReveal++;
+        }
+
+        const op = decideByLadder(defaultLadder, { view, analysis: a, clickable: click, rng: lcg(2000 + g + step) });
+        const r = b.pick(op.action.tileId); if (!r.ok) break;
+        if (r.paired) { b.eliminate(r.paired[0], r.paired[1]); b.compactSlots(); }
+        if (b.isSlotFull() && !b.findSlotPair()) break;
+      }
+    }
+  }
+  console.log(`    样本:${S.steps} 步(盘面 ${S.minTiles}~${S.maxTiles} 张)· 匹配条目 ${S.entries} 条、共 ${S.simSteps} 个模拟步`
+    + `(其中结束时有遗留牌的 ${S.withResidual} 条、启动牌在槽内的 ${S.launcherInSlot} 条)· 揭示预演 ${S.reveals} 次`);
+  check('消除模拟:新实现与旧的逐步全盘重算逐条目、逐字段一致(峰值/占用序列/剩余牌/步数/拿牌顺序)',
+    S.badSim === 0, `${S.badSim} 条不一致;首例:${S.firstBad}`);
+  check('样本量足够(≥ 200 步、≥ 1000 条匹配、覆盖残局)',
+    S.steps >= 200 && S.entries >= 1000 && S.minTiles <= 10, JSON.stringify(S));
+  check('揭示预演:拿走一张后变可点的直接目标,与在假设集合上全盘重算一致',
+    S.badReveal === 0, `${S.badReveal}/${S.reveals} 次不一致`);
 }
 
 console.log(`\n结果:${pass} 通过,${fail} 失败`);

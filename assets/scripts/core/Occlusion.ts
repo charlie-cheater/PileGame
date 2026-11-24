@@ -145,6 +145,118 @@ export function occlusionArea(occluder: OcclusionSubject, target: OcclusionSubje
   return overlapArea(coverRectOf(occluder, target) ?? { x: 0, y: 0, w: 0, h: 0 }, faceRectOf(target));
 }
 
+// ─────────────────────────── 遮挡关系索引(v3 口径的结构部分) ───────────────────────────
+
+/** 一条覆盖贡献:遮挡者 by 投在本牌顶面上的矩形 rect,及是否跨层侧边擦及 */
+export interface CoverContribution {
+  /** 遮挡者 tileId */
+  by: number;
+  /** 覆盖贡献矩形(= coverRectOf(遮挡者, 本牌)) */
+  rect: UnitRect;
+  /** 遮挡者跨层且其侧面擦及本牌顶面(侧边免阈条款) */
+  sideTouch: boolean;
+}
+
+/** 遮挡关系索引:固定牌位下「谁压着谁」的全部结构信息,与被压判定的阈值部分相分离。
+ *  同一盘面的多次「移除若干张后再判被压」(消除模拟、揭示预演)共用一份,
+ *  不必每次全盘重算。 */
+export interface OcclusionIndex {
+  /** tileId → 全部覆盖贡献(所有 z 更高的 pile 牌) */
+  coversOf: Map<number, CoverContribution[]>;
+  /** tileId(遮挡者)→ 它直接压着的牌 */
+  coveredBy: Map<number, number[]>;
+  /** 全部牌的 tileId,升序(按它遍历即得升序的可点集) */
+  order: number[];
+}
+
+/**
+ * 收集遮挡关系(v3 口径的结构部分;computeOcclusion 的前半步)。
+ * 对每张牌累计:全部 z 更高 pile 牌的覆盖贡献矩形,以及是否跨层侧边擦及。
+ * 规则一字未改——与 2026-11-22 裁定的 v3 并集口径同源;2026-11-24 仅把
+ * 「收集」与「逐牌求面积」拆开,供索引复用(消除模拟提速,方案甲)。
+ */
+function collectCovers(tiles: ReadonlyArray<Tile>): OcclusionIndex {
+  const index: OcclusionIndex = { coversOf: new Map(), coveredBy: new Map(), order: [] };
+  for (const t of tiles) {
+    index.coversOf.set(t.tileId, []);
+    index.coveredBy.set(t.tileId, []);
+    index.order.push(t.tileId);
+  }
+
+  const accumulate = (o: OcclusionSubject, target: Tile): void => {
+    const c = coverRectOf(o, target);
+    if (!c) return;
+    const sideTouch = o.layer > target.layer && overlapArea(sideRectOf(o), faceRectOf(target)) > 0;
+    index.coversOf.get(target.tileId)!.push({ by: o.tileId, rect: c, sideTouch });
+    index.coveredBy.get(o.tileId)!.push(target.tileId);
+  };
+
+  for (let i = 0; i < tiles.length; i++) {
+    for (let j = i + 1; j < tiles.length; j++) {
+      const A = tiles[i];
+      const B = tiles[j];
+      if (A.status !== 'pile' || B.status !== 'pile') continue;
+      accumulate(B, A);   // isAbove 已在 coverRectOf 内判
+      accumulate(A, B);
+    }
+  }
+  index.order.sort((a, b) => a - b);
+  return index;
+}
+
+/** 剩余覆盖贡献下的被压判定(computeOcclusion 的后半步,对单张牌)。
+ *  blocked ⇔ 剩余贡献里有跨层侧边擦及,或 剩余覆盖并集 / 顶面面积 > 阈值 */
+function isBlockedBy(covers: ReadonlyArray<CoverContribution>, removed: ReadonlySet<number>): boolean {
+  let sideTouch = false;
+  const rects: UnitRect[] = [];
+  for (const c of covers) {
+    if (removed.has(c.by)) continue;
+    rects.push(c.rect);
+    if (c.sideTouch) sideTouch = true;
+  }
+  return sideTouch || unionArea(rects) / (TILE.w * TILE.h) > TILE.overlapThreshold;
+}
+
+/**
+ * 为一组固定牌位的 pile 牌建立遮挡关系索引(全量,一次)。
+ * 输入须全部为 status === 'pile' 的牌(感知集即满足)。
+ * 配合 blockedAfter 使用:同一盘面下任意移除集的被压判定,不必全盘重算。
+ */
+export function buildOcclusionIndex(tiles: ReadonlyArray<Tile>): OcclusionIndex {
+  for (const t of tiles) {
+    if (t.status !== 'pile') throw new Error(`buildOcclusionIndex: 牌 ${t.tileId} 不在堆上(status=${t.status})`);
+  }
+  return collectCovers(tiles);
+}
+
+/**
+ * 索引法被压判定:移除 removed 之后,一张仍未被移除的牌是否被压。
+ * 与 computeOcclusion(原盘面 − removed) 对该牌的 blocked 严格等价
+ * (同一份覆盖贡献、同一判定式;tests/occlusion-v3 有等价性回归)。
+ * 调用方负责保证 target 自身不在 removed 里。
+ */
+export function blockedAfter(index: OcclusionIndex, target: number, removed: ReadonlySet<number>): boolean {
+  return isBlockedBy(index.coversOf.get(target) ?? [], removed);
+}
+
+/** 由索引求全部牌的派生态(computeOcclusion 的后半步,全量;移除集为空)。
+ *  已有索引时用它,不要再调 computeOcclusion 重复收集一遍 */
+export function deriveOcclusion(index: OcclusionIndex, tiles: ReadonlyArray<Tile>): Map<number, TileDerived> {
+  const none = new Set<number>();
+  const result = new Map<number, TileDerived>();
+  for (const t of tiles) {
+    const blocked = t.status === 'pile' && isBlockedBy(index.coversOf.get(t.tileId)!, none);
+    result.set(t.tileId, {
+      blocked,
+      clickable: t.status === 'pile' && !blocked,
+      faceRect: faceRectOf(t),
+      sideRect: sideRectOf(t),
+      totalRect: totalRectOf(t),
+    });
+  }
+  return result;
+}
+
 // ─────────────────────────── 全量重算 ───────────────────────────
 
 /**
@@ -155,49 +267,12 @@ export function occlusionArea(occluder: OcclusionSubject, target: OcclusionSubje
  *   覆盖并集 / 顶面面积 > TILE.overlapThreshold,或跨层侧边擦及(免阈条款);
  * 仅 status === 'pile' 的牌作为遮挡者参与;
  * clickable = status === 'pile' && !blocked。
+ *
+ * 2026-11-24 起内部拆为「收集遮挡关系」+「逐牌求面积」两步(规则不变):
+ *   collectCovers → deriveOcclusion;输入全为 pile 牌且需要反复按移除集
+ *   求被压时(消除模拟、揭示预演),改用 buildOcclusionIndex + deriveOcclusion +
+ *   blockedAfter,收集只做一次。
  */
 export function computeOcclusion(tiles: ReadonlyArray<Tile>): Map<number, TileDerived> {
-  interface Entry {
-    t: Tile;
-    face: UnitRect;
-    total: UnitRect;
-    covers: UnitRect[];
-    sideTouch: boolean;
-    blocked: boolean;
-  }
-  const info: Entry[] = tiles.map(t => ({
-    t, face: faceRectOf(t), total: totalRectOf(t),
-    covers: [], sideTouch: false, blocked: false,
-  }));
-
-  const accumulate = (o: OcclusionSubject, e: Entry): void => {
-    const c = coverRectOf(o, e.t);
-    if (!c) return;
-    e.covers.push(c);
-    if (o.layer > e.t.layer && overlapArea(sideRectOf(o), e.face) > 0) e.sideTouch = true;
-  };
-
-  for (let i = 0; i < info.length; i++) {
-    for (let j = i + 1; j < info.length; j++) {
-      const A = info[i];
-      const B = info[j];
-      if (A.t.status !== 'pile' || B.t.status !== 'pile') continue;
-      accumulate(B.t, A);   // isAbove 已在 coverRectOf 内判
-      accumulate(A.t, B);
-    }
-  }
-
-  const result = new Map<number, TileDerived>();
-  for (const e of info) {
-    const covered = unionArea(e.covers);   // 并集求积,不计交叠双计
-    e.blocked = e.sideTouch || covered / (TILE.w * TILE.h) > TILE.overlapThreshold;
-    result.set(e.t.tileId, {
-      blocked: e.blocked,
-      clickable: e.t.status === 'pile' && !e.blocked,
-      faceRect: e.face,
-      sideRect: sideRectOf(e.t),
-      totalRect: e.total,
-    });
-  }
-  return result;
+  return deriveOcclusion(collectCovers(tiles), tiles);
 }

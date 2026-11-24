@@ -2,13 +2,17 @@
 // occlusion-v3.test.js — v3 并集口径回归测试(node 直跑,不依赖 cc)
 //
 // 运行前需将 core 编译到 temp/v3check(纯逻辑层无 cc 依赖):
-//   npx -y -p typescript@5.4.5 tsc assets/scripts/core/*.ts --outDir temp/v3check \
+//   npx -y -p typescript@5.4.5 tsc assets/scripts/core/*.ts \
+//     assets/scripts/agent/Perception.ts assets/scripts/agent/Analysis.ts \
+//     assets/scripts/agent/Ladder.ts assets/scripts/agent/Runner.ts \
+//     --rootDir assets/scripts --outDir temp/v3check \
 //     --module commonjs --target es2019 --skipLibCheck --esModuleInterop
 //   node tests/occlusion-v3.test.js
 // ============================================================================
 
 const { TILE } = require('../temp/v3check/core/tile');
-const { computeOcclusion, coversAny, pressesOn, unionArea } = require('../temp/v3check/core/Occlusion');
+const { computeOcclusion, coversAny, pressesOn, unionArea,
+  buildOcclusionIndex, blockedAfter, deriveOcclusion } = require('../temp/v3check/core/Occlusion');
 const { computeVisibleState } = require('../temp/v3check/core/Visibility');
 const { computeDepths } = require('../temp/v3check/core/Depth');
 const { Board } = require('../temp/v3check/core/Board');
@@ -136,4 +140,94 @@ console.log('— Case E:编辑器布局冒烟(test_layout.json,70 张,填充 see
 }
 
 console.log(`\n结果:${pass} 通过,${fail} 失败`);
+
+// ============================================================================
+// 等价性回归(2026-11-24,消除模拟提速·方案甲):遮挡关系索引法 ⇔ 全盘重算。
+// 提速不改变任何规则,只改变计算方式——以下断言保证「计算方式」没有改变结果。
+// 被测:buildOcclusionIndex / deriveOcclusion / blockedAfter;参照:computeOcclusion。
+// ============================================================================
+const { perceive } = require('../temp/v3check/agent/Perception');
+const { analyze } = require('../temp/v3check/agent/Analysis');
+const { decideByLadder, defaultLadder } = require('../temp/v3check/agent/Ladder');
+const { lcg, fisherYates } = require('../temp/v3check/core/LevelBuilder');
+
+console.log('— 等价性回归:遮挡关系索引法 ⇔ 全盘重算 —');
+{
+  const mkEls = n => Array.from({ length: n }, (_, i) => ({ elementId: 'u' + (i + 1), displayName: 'e', color: '#fff' }));
+  // 用默认梯跑真实对局,沿途收集每个阶段的感知集——必须覆盖到残局的小盘面
+  const boards = [];
+  for (const n of [7, 14, 35]) for (let seed = 0; seed < 4; seed++) {
+    const els = mkEls(n);
+    const b = new Board({ board: LAYOUT.board, elements: els, tiles: fillSlots(LAYOUT.tiles, { elements: els, seed: 1000 + seed }) });
+    for (let step = 0; step < 300; step++) {
+      if (b.isCleared()) break;
+      const view = perceive(b);
+      if (view.perceived.length === 0) break;
+      boards.push(view.perceived.map(t => ({ ...t })));
+      const a = analyze(view);
+      const click = view.perceived.filter(t => a.derived.get(t.tileId).clickable);
+      if (click.length === 0) break;
+      const op = decideByLadder(defaultLadder, { view, analysis: a, clickable: click, rng: lcg(2000 + seed + step) });
+      const r = b.pick(op.action.tileId); if (!r.ok) break;
+      if (r.paired) { b.eliminate(r.paired[0], r.paired[1]); b.compactSlots(); }
+      if (b.isSlotFull() && !b.findSlotPair()) break;
+    }
+  }
+  const S = { tested: 0, tiles: 0, badDerived: 0, sets: 0, badSet: 0, seqSteps: 0, badSeq: 0, sizes: {} };
+  boards.forEach((tiles, bi) => {
+    if (bi % 3 !== 0) return;                      // 每 3 个盘面取 1 个:全程各阶段均匀抽样
+    S.tested++; S.tiles += tiles.length;
+    const k = tiles.length < 10 ? '<10' : tiles.length < 25 ? '10~24' : tiles.length < 40 ? '25~39' : '40+';
+    S.sizes[k] = (S.sizes[k] || 0) + 1;
+    const index = buildOcclusionIndex(tiles);
+
+    // ① 移除集为空:由索引得出的派生态 === computeOcclusion(逐牌比 blocked 与 clickable)
+    const viaIndex = deriveOcclusion(index, tiles);
+    const full = computeOcclusion(tiles);
+    for (const t of tiles) {
+      const x = viaIndex.get(t.tileId), y = full.get(t.tileId);
+      if (x.blocked !== y.blocked || x.clickable !== y.clickable) S.badDerived++;
+    }
+
+    // ② 任意移除集(密度 0~1):blockedAfter === computeOcclusion(剩余牌).blocked
+    for (let trial = 0; trial < 6; trial++) {
+      const rng = lcg(trial * 7919 + tiles.length * 31 + bi);
+      const removed = new Set(tiles.filter(() => rng() < trial / 5).map(t => t.tileId));
+      S.sets++;
+      const truth = computeOcclusion(tiles.filter(t => !removed.has(t.tileId)));
+      for (const t of tiles) {
+        if (removed.has(t.tileId)) continue;
+        if (blockedAfter(index, t.tileId, removed) !== truth.get(t.tileId).blocked) S.badSet++;
+      }
+    }
+
+    // ③ 逐步移除(消除模拟的拿牌方式):每移除一张就逐牌比较
+    const order = tiles.map(t => t.tileId);
+    fisherYates(order, lcg(bi * 104729 + tiles.length));
+    const removed = new Set();
+    for (const x of order) {
+      removed.add(x); S.seqSteps++;
+      const truth = computeOcclusion(tiles.filter(t => !removed.has(t.tileId)));
+      for (const t of tiles) {
+        if (removed.has(t.tileId)) continue;
+        if (blockedAfter(index, t.tileId, removed) !== truth.get(t.tileId).blocked) S.badSeq++;
+      }
+    }
+  });
+  console.log(`    样本:${S.tested} 个盘面、${S.tiles} 张次(张数分布 ${JSON.stringify(S.sizes)});`
+    + `逐牌比较 ${S.sets} 组任意移除集 + ${S.seqSteps} 步逐步移除`);
+  check('移除集为空:由索引得出的派生态与 computeOcclusion 逐牌一致', S.badDerived === 0, `不一致 ${S.badDerived}`);
+  check('任意移除集:索引法被压判定与全盘重算逐牌一致', S.badSet === 0, `不一致 ${S.badSet}`);
+  check('逐步移除(模拟式拿牌):索引法被压判定与全盘重算逐牌一致', S.badSeq === 0, `不一致 ${S.badSeq}`);
+  check('样本覆盖各阶段(含 10 张以下的残局与 40 张以上的开局)',
+    (S.sizes['<10'] || 0) > 0 && (S.sizes['40+'] || 0) > 0, JSON.stringify(S.sizes));
+  check('buildOcclusionIndex 拒绝非堆上的牌(输入须全为 pile)', (() => {
+    try {
+      buildOcclusionIndex([{ elementId: 'x', variant: 'FULL', gx: 0, gy: 2, layer: 0, tileId: 0, status: 'slot', slotIndex: 0 }]);
+      return false;
+    } catch (e) { return /不在堆上/.test(e.message); }
+  })());
+}
+
+console.log(`\n合计(含等价性回归):${pass} 通过,${fail} 失败`);
 process.exit(fail > 0 ? 1 : 0);

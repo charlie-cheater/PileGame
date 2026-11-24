@@ -13,8 +13,8 @@
 const { Board } = require('../temp/v3check/core/Board');
 const { perceive } = require('../temp/v3check/agent/Perception');
 const { analyze, simulateReveal } = require('../temp/v3check/agent/Analysis');
-const { decideByLadder, ladderPolicy, slotCloseRung, pairCompleteRung, chainRung, wanderRung,
-  defaultLadder, scorePick, pickDelta, simulateAnalysisAfterPick, simulateViewAfterPick,
+const { decideByLadder, ladderPolicy, slotCloseRung, pairCompleteRung, digRung, selectDigMatch,
+  exploreRung, wanderRung, defaultLadder, pickDelta, simulateAnalysisAfterPick, simulateViewAfterPick,
   comparePickDelta, deltaScore } = require('../temp/v3check/agent/Ladder');
 const { runAgent } = require('../temp/v3check/agent/Runner');
 
@@ -160,7 +160,7 @@ console.log('— 梯语义:slot-close / pair-complete / wander —');
     slotCloseRung.decide(uctx) === null && pairCompleteRung.decide(uctx) === null);
 }
 
-console.log('— 优先级实证:slot-close 须先于 pair-complete(防半张占槽) —');
+console.log('— 优先级实证:slot-close 先于 pair-complete(槽压峰值更低) —');
 {
   // 槽 1 张 + 三组双亮对并存:两梯均可触发 → 阵序决定行为
   const board = flatLevel();
@@ -172,11 +172,21 @@ console.log('— 优先级实证:slot-close 须先于 pair-complete(防半张占
   check('阵序即优先级:[pairComplete, slotClose] → pair-complete',
     decideByLadder([pairCompleteRung, slotCloseRung], ctx).reason.rule === 'pair-complete');
 
-  // 行为实证:pair-complete 优先会连续持半占满 4 槽判负;slot-close 优先清盘
-  const rBad = runAgent(new Board(board), { seed: 7,
-    decision: ladderPolicy([pairCompleteRung, slotCloseRung, wanderRung]) });
-  check('逆序梯(pairComplete 先)平盘 4 pick 槽满判负',
-    rBad.outcome === 'slot_full' && rBad.picks === 4, `outcome=${rBad.outcome} picks=${rBad.picks}`);
+  // 2026-11-24 起 pair-complete 只收可执行的 double(空槽 < 2 让位),
+  // 「逆序梯连续持半致槽满判负」已被门槛排除——逆序梯同样清盘。
+  // 但先后顺序仍影响槽压峰值:先闭合再开对,手里不会同时压多张半张
+  {
+    const seedBoard = () => { const b = new Board(board); b.pick(0); return b; };   // 槽内预置 E1a
+    const fwd = runAgent(seedBoard(), { seed: 7, decision: ladderPolicy() });
+    const inv = runAgent(seedBoard(), { seed: 7,
+      decision: ladderPolicy([pairCompleteRung, slotCloseRung, wanderRung]) });
+    check('门槛生效:逆序梯不再判负(空槽不足时 pair-complete 让位),同样清盘',
+      fwd.outcome === 'cleared' && inv.outcome === 'cleared' && fwd.picks === 7 && inv.picks === 7,
+      `fwd=${fwd.outcome}/${fwd.picks} inv=${inv.outcome}/${inv.picks}`);
+    check('先后顺序仍影响槽压峰值:正序 1 < 逆序 3(逆序先开对,手里同时压 3 张半张)',
+      fwd.maxSlotPressure === 1 && inv.maxSlotPressure === 3,
+      `fwd 峰值=${fwd.maxSlotPressure} inv 峰值=${inv.maxSlotPressure}`);
+  }
 }
 
 console.log('— Runner 集成:defaultLadder 通关 + 预期对账 + 可重放 —');
@@ -301,8 +311,6 @@ console.log('— 揭示预演 simulateReveal:clickable 的激活类型 —');
   check('预演求和:activationSum = 1.0 + 0.2 = 1.2;nonClickable 空',
     near(f.activationSum, 1.2) && f.nonClickable.length === 0 && f.nearCount === 0);
   check('hiddenRisk 当前恒 0(用户裁定:计算暂缓)', f.clickable.every(c => c.hiddenRisk === 0));
-  check('scorePick = 0.7×1.2 + 0.3×0 = 0.84', near(scorePick(3, ctx).score, 0.84),
-    `score=${scorePick(3, ctx).score}`);
 
   // ⑤对账面:本盘无隐藏牌 → 主观预演 = 真值(实际拿走 m 后的可点集)
   b.pick(3);
@@ -348,7 +356,6 @@ console.log('— 揭示预演 simulateReveal:clickable 的激活类型 —');
   check('near:拿走 m 后 t 仍被 n 压,但 n 可点 → near;activationSum 0',
     fn.clickable.length === 0 && fn.nonClickable.length === 1 && fn.nonClickable[0].near === true
     && fn.nearCount === 1 && fn.activationSum === 0);
-  check('scorePick = 0.7×0 + 0.3×1 = 0.3', near(scorePick(2, ctxN).score, 0.3));
 
   const ctxF = buildCtx(new Board({ board: { w: 20, h: 24 }, elements: els,
     tiles: [...base, mk('Q', 0, 2, 2)] }));
@@ -362,124 +369,211 @@ console.log('— 揭示预演 simulateReveal:clickable 的激活类型 —');
     JSON.stringify(ff.nonClickable));
 }
 
-console.log('— chain 梯:借槽两步闭合(slot / pair 两类)—');
+console.log('— dig 梯(基础数据选择):候选来源 / 排序占位 / 动作 / 门槛 / 端到端 —');
+// 2026-11-24:原 chain 梯整体移除——借槽两步闭合的两类机会在 MatchReport 中均为
+// 可执行的 hold 型匹配(峰值 2),由 dig 梯(除 close / double 外的可执行匹配)覆盖。
+// 匹配间的排序待设计裁定,现暂取 MatchReport 既有顺序(消耗升序,同消耗按 elementId)。
 {
-  // C1 chain-slot:槽内有 X 半张;a(2) 揭出的 b(1) 是 X → 下一步拿 b 即闭
-  //   sX(0)'X'@(16,2,L0) 入槽;b(1)'X'@(0,2,L0) 仅被 a(2)'A'@(0,12,L1) 压(16)
-  const b = new Board(level(24, 24, [['X', 16, 2, 0], ['X', 0, 2, 0], ['A', 0, 12, 1]]));
+  // DG1 候选来源:close 型、double 型、不可执行的匹配都不收
+  //   槽:u0(0)'U' x0(4)'X';u(1)'U' 可点 → U 为 close;p(2) p(3)'P' → double
+  //   b(5)'X' 被 a(6)'A'@(40,12,L1) 压 → X 为 hold(峰值 2,空槽 2 → 可执行)
+  //   z(7) 被 n(8) 压、z'(9) 被 n'(10) 压 → Z 为 dig(峰值 4 > 2 → 不可执行)
+  const b = new Board(level(80, 24, [['U', 0, 2, 0], ['U', 8, 2, 0], ['P', 16, 2, 0], ['P', 24, 2, 0],
+    ['X', 32, 2, 0], ['X', 40, 2, 0], ['A', 40, 12, 1], ['Z', 56, 2, 0], ['N', 56, 12, 1],
+    ['Z', 72, 2, 0], ['N2', 72, 12, 1]]));
+  b.pick(0); b.pick(4);
+  const ctx = buildCtx(b);
+  const byType = ctx.analysis.matches.opportunities.map(o => `${o.elementId}:${o.type}:${o.executable}`).join(' ');
+  check('前置:U 为 close、P 为 double、X 为 hold(可执行)、Z 为 dig(不可执行);空槽 2',
+    byType === 'U:close:true P:double:true X:hold:true Z:dig:false' && ctx.analysis.matches.emptySlots === 2,
+    byType);
+  check('候选来源:只选出可执行的 hold / dig → 唯一候选 X',
+    (selectDigMatch(ctx) || {}).elementId === 'X');
+  const op = digRung.decide(ctx);
+  check('dig 出手:rule = dig,reason.match 结构化记录所选匹配(X / hold / 启动 4 / 目标 5 / 消耗 2)',
+    op !== null && op.reason.rule === 'dig' && op.action.tileId === 6
+      && JSON.stringify(op.reason.match) === JSON.stringify({ elementId: 'X', type: 'hold', launcher: 4, target: 5, matchCost: 2 }),
+    `pick=${op && op.action.tileId} match=${JSON.stringify(op && op.reason.match)}`);
+  check('reason 注明消耗与空槽数、计划步数',
+    op.reason.note.includes('消耗 2/2 格') && op.reason.note.includes('计划 3 步'),
+    `note="${op.reason.note}"`);
+}
+{
+  // DG2 排序(占位):暂取 MatchReport 既有顺序——消耗升序
+  //   槽:x0(0)'X';b(1)'X' 被 a(2)'A'@(8,12,L1) 压 → X 为 hold(峰值 2)
+  //   y(3)'Y' 可点,y'(4)'Y' 被 b'(5)'B'@(32,12,L1) 压 → Y 为 hold(峰值 3)
+  const b = new Board(level(48, 24, [['X', 0, 2, 0], ['X', 8, 2, 0], ['A', 8, 12, 1],
+    ['Y', 24, 2, 0], ['Y', 32, 2, 0], ['B', 32, 12, 1]]));
   b.pick(0);
   const ctx = buildCtx(b);
-  check('前置:前两梯让位(槽内 X 的伴被压;无同元素双亮)',
-    slotCloseRung.decide(ctx) === null && pairCompleteRung.decide(ctx) === null);
-  const f = simulateReveal(2, ctx.view, ctx.analysis);
-  check('预演分类 slot:揭出的 b 判 closes 且 chain = slot(与槽内半张闭合)',
-    f.clickable.length === 1 && f.clickable[0].tileId === 1
-    && f.clickable[0].activation === 'closes' && f.clickable[0].chain === 'slot');
-  const op = chainRung.decide(ctx);
-  check('chain-slot:拿 a,记录链路 {b, slot},效能 0.7',
-    op !== null && op.reason.rule === 'chain' && op.action.tileId === 2
-    && JSON.stringify(op.reason.chain) === JSON.stringify([{ tileId: 1, kind: 'slot' }])
-    && near(op.reason.utility, 0.7));
-  check('chain-slot 预期:本次不闭对 / slotAfter 2 / exposes [b] / likely',
-    op.expectation.pairCompletes === false && op.expectation.slotAfter === 2
-    && JSON.stringify(op.expectation.exposes) === JSON.stringify([1])
-    && op.expectation.confidence === 'likely');
+  const costs = ctx.analysis.matches.opportunities.map(o => `${o.elementId}:${o.type}:${o.matchCost}`).join(' ');
+  check('前置:两个可执行的 hold——X 峰值 2、Y 峰值 3;空槽 3',
+    costs === 'X:hold:2 Y:hold:3' && ctx.analysis.matches.emptySlots === 3, costs);
+  check('排序:遗留少者先(X 遗留 1 张 < Y 的 2 张;恰与消耗同序)→ 选 X,动作 = 其计划第一步 a(2)',
+    (selectDigMatch(ctx) || {}).elementId === 'X' && digRung.decide(ctx).action.tileId === 2);
+  // 同遗留同消耗并列 → 按 elementId(L 与 T 遗留各 1 张、消耗同 3 格)
+  const ctxT = buildCtx(new Board(level(48, 24, [['L', 0, 2, 0], ['L', 8, 2, 0], ['M', 0, 12, 1],
+    ['T', 24, 2, 0], ['T', 32, 2, 0], ['N', 24, 12, 1]])));
+  check('排序:同遗留同消耗并列 → 按 elementId(L 先于 T)',
+    ctxT.analysis.matches.opportunities.map(o => `${o.elementId}:${o.matchCost}`).join(' ') === 'L:3 T:3'
+      && (selectDigMatch(ctxT) || {}).elementId === 'L');
 }
 {
-  // C2 chain-pair:无槽;a(1) 与它揭出的 b(0) 同元素 Y → b 下一步与 a 闭合
-  //   (修正前 b 被判 lone:预演曾把「刚拿的牌」当作从游戏中消失)
-  const ctx = buildCtx(new Board(level(16, 24, [['Y', 0, 2, 0], ['Y', 0, 12, 1]])));
-  const f = simulateReveal(1, ctx.view, ctx.analysis);
-  check('预演分类 pair:揭出的同元素 b 判 closes 且 chain = pair(与本次拿的这张闭合)',
-    f.clickable.length === 1 && f.clickable[0].activation === 'closes'
-    && f.clickable[0].chain === 'pair' && near(f.activationSum, 1.0));
-  const op = chainRung.decide(ctx);
-  check('chain-pair:拿 a,记录链路 {b, pair},效能 0.7 + pair 加分 0.3 = 1.0',
-    op !== null && op.action.tileId === 1 && near(op.reason.utility, 1.0)
-    && JSON.stringify(op.reason.chain) === JSON.stringify([{ tileId: 0, kind: 'pair' }]));
+  // DG3 动作 = 消除模拟计划的第一次拾取(可执行性正是针对这套顺序得出的)
+  //   启动牌在槽内(X 半张,目标牌 b(1) 被 a(2) 压)→ 先拿遮挡者
+  const bS = new Board(level(24, 24, [['X', 16, 2, 0], ['X', 0, 2, 0], ['A', 0, 12, 1]]));
+  bS.pick(0);
+  const inSlot = buildCtx(bS);
+  check('动作·启动牌在槽内:拿目标牌的遮挡者(计划 2→1 → 拿 2)',
+    inSlot.analysis.matches.opportunities[0].cost.picks.join(',') === '2,1'
+      && digRung.decide(inSlot).action.tileId === 2);
+  //   启动牌 a(1) 可点、目标牌 b(0) 被压 → 先拿启动牌(它入槽等待)
+  const lit = buildCtx(new Board(level(16, 24, [['Y', 0, 2, 0], ['Y', 0, 12, 1]])));
+  check('动作·启动牌可点:拿启动牌(计划 1→0 → 拿 1)', digRung.decide(lit).action.tileId === 1);
+  //   两张都被压(dig 型)→ 先拿启动牌的遮挡者
+  //     z(0)'Z' 被 n(1)'N'@(0,12,L1) 压;z'(2)'Z' 被 n'(3)'N2'@(16,12,L1) 压;空槽 4,峰值 4
+  const dig = buildCtx(new Board(level(24, 24, [['Z', 0, 2, 0], ['N', 0, 12, 1], ['Z', 16, 2, 0], ['N2', 16, 12, 1]])));
+  const z = dig.analysis.matches.opportunities[0];
+  const opD = digRung.decide(dig);
+  check('动作·dig 型:拿启动牌的遮挡者(计划 1→0→3→2 → 拿 1);reason.match 记 dig / 消耗 4',
+    z.type === 'dig' && z.matchCost === 4 && z.executable && z.cost.picks.join(',') === '1,0,3,2'
+      && opD.action.tileId === 1
+      && JSON.stringify(opD.reason.match) === JSON.stringify({ elementId: 'Z', type: 'dig', launcher: 0, target: 2, matchCost: 4 }),
+    `pick=${opD && opD.action.tileId} match=${JSON.stringify(opD && opD.reason.match)}`);
 }
 {
-  // C3 可用性是开关:空槽 = 1 时整梯让位(拿 a 即满槽,揭出的伴进不来);空槽 = 2 时可用
-  //   b(0)'X'@(0,2,L0) 仅被 a(1)'A'@(0,12,L1) 压;槽内 X / U(/ V)
+  // DG4 门槛:不可执行的匹配不收(空槽 1 时 hold 峰值 2 > 1)
   const spec = [['X', 0, 2, 0], ['A', 0, 12, 1], ['X', 16, 2, 0], ['U', 24, 2, 0], ['V', 32, 2, 0]];
-  const b1 = new Board(level(40, 24, spec));
-  b1.pick(2); b1.pick(3); b1.pick(4);
-  check('空槽 1:chain 让位(尽管预演能揭出槽内 X 的伴)', chainRung.decide(buildCtx(b1)) === null);
-  const b2 = new Board(level(40, 24, spec));
-  b2.pick(2); b2.pick(3);
-  const op2 = chainRung.decide(buildCtx(b2));
-  check('空槽 2:chain 可用', op2 !== null && op2.action.tileId === 1);
+  const b = new Board(level(40, 24, spec));
+  b.pick(2); b.pick(3); b.pick(4);
+  const ctx = buildCtx(b);
+  const only = ctx.analysis.matches.opportunities;
+  check('空槽 1:唯一的 hold 不可执行 → dig 让位',
+    ctx.analysis.matches.emptySlots === 1 && only.length === 1 && only[0].type === 'hold' && !only[0].executable
+      && selectDigMatch(ctx) === null && digRung.decide(ctx) === null);
+  // DG5 负例:只有 double(归 pair-complete)→ dig 让位
+  const flat = buildCtx(new Board(flatLevel()));
+  check('只有 double 型匹配 → dig 让位', selectDigMatch(flat) === null && digRung.decide(flat) === null);
 }
 {
-  // C4 两类并存:同梯按效能取最大;同分取 tileId 小者
-  //   左:aP(1)'Y'@(0,12,L1) 揭 bP(0)'Y' → pair
-  //   右:aS(4)'A'@(16,12,L1) 揭 bS(2)'X'(槽内有 X)→ slot,另揭 bL(3)'L'(无伴 → lone)
-  //   槽:sX(5)'X'@(32,2,L0)
-  const b = new Board(level(40, 28, [['Y', 0, 2, 0], ['Y', 0, 12, 1], ['X', 16, 2, 0],
-    ['L', 16, 16, 0], ['A', 16, 12, 1], ['X', 32, 2, 0]]));
-  b.pick(5);
-  const op = chainRung.decide(buildCtx(b));
-  check('槽位干净优先:pair 链(1.0)胜 slot 链多揭 1 张散牌(0.84)',
-    op.action.tileId === 1 && near(op.reason.utility, 1.0)
-    && JSON.stringify(op.reason.chain) === JSON.stringify([{ tileId: 0, kind: 'pair' }])
-    && op.reason.runnerUp && op.reason.runnerUp.tileId === 4 && near(op.reason.runnerUp.score, 0.84));
-  // 揭出牌数相同的盘:位置同上但数组序对调——slot 链 aS = 1(tileId 更小),pair 链 aP = 3
-  const bT = new Board(level(40, 28, [['X', 16, 2, 0], ['A', 16, 12, 1], ['Y', 0, 2, 0],
-    ['Y', 0, 12, 1], ['X', 32, 2, 0]]));
-  bT.pick(4);
-  const opT = chainRung.decide(buildCtx(bT));
-  check('揭出牌数相同时 pair 链胜出(即便 slot 链 tileId 更小):1.0 对 0.70',
-    opT.action.tileId === 3 && opT.reason.chain[0].kind === 'pair' && near(opT.reason.utility, 1.0)
-    && opT.reason.runnerUp && opT.reason.runnerUp.tileId === 1 && near(opT.reason.runnerUp.score, 0.7),
-    `pick=${opT.action.tileId} u=${opT.reason.utility} ru=${JSON.stringify(opT.reason.runnerUp)}`);
-  // 加分的上界:slot 链若多揭出一张 pairs 牌(同元素 j0 已可点),揭露优势仍胜出
-  //   aP(1)'Y'@(0,12,L1) 揭 bP(0)'Y' → pair
-  //   aS(4)'A'@(16,12,L1) 揭 bS(2)'X'(槽内有 X → slot)+ pP(3)'J'(j0(5) 已可点 → pairs)
-  //   槽:sX(6)'X'@(32,12,L0)
-  const bB = new Board(level(40, 28, [['Y', 0, 2, 0], ['Y', 0, 12, 1], ['X', 16, 2, 0],
-    ['J', 16, 16, 0], ['A', 16, 12, 1], ['J', 32, 2, 0], ['X', 32, 12, 0]]));
-  bB.pick(6);
-  const opB = chainRung.decide(buildCtx(bB));
-  check('加分上界:slot 链多揭 1 张 pairs 牌(1.26)仍胜 pair 链(1.0)',
-    opB.action.tileId === 4 && near(opB.reason.utility, 1.26)
-    && JSON.stringify(opB.reason.chain) === JSON.stringify([{ tileId: 2, kind: 'slot' }])
-    && opB.reason.runnerUp && opB.reason.runnerUp.tileId === 1 && near(opB.reason.runnerUp.score, 1.0),
-    `pick=${opB.action.tileId} u=${opB.reason.utility} ru=${JSON.stringify(opB.reason.runnerUp)}`);
-}
-{
-  // C6 负例:揭出的牌无已知伴 → 不是 chain
-  const ctx = buildCtx(new Board(level(16, 24, [['B', 0, 2, 0], ['A', 0, 12, 1]])));
-  check('揭出的牌无伴(lone):chain 让位', chainRung.decide(ctx) === null);
-}
-{
-  // 端到端(defaultLadder):chain → 下一步 slot-close 闭合
-  //   C2 盘:a 入槽 → b 揭出 → slot-close 拿 b 与 a 闭合 → 清盘
-  const r = runAgent(new Board(level(16, 24, [['Y', 0, 2, 0], ['Y', 0, 12, 1]])),
-    { seed: 7, decision: ladderPolicy() });
-  check('chain-pair 端到端:chain(pair) → slot-close 闭合,2 pick 清盘',
-    r.outcome === 'cleared' && r.picks === 2 && r.pairsEliminated === 1
-    && r.steps[0].operation.rule === 'chain' && r.steps[0].operation.chain[0].kind === 'pair'
-    && r.steps[1].operation.rule === 'slot-close' && r.steps[1].paired === true,
+  // DG6 端到端(defaultLadder)
+  //   启动牌可点的 hold:dig 拿启动牌 → slot-close 闭合 → 清盘
+  const r = runAgent(new Board(level(16, 24, [['Y', 0, 2, 0], ['Y', 0, 12, 1]])), { seed: 7, decision: ladderPolicy() });
+  check('端到端·hold:dig → slot-close 闭合,2 pick 清盘',
+    r.outcome === 'cleared' && r.picks === 2 && r.steps.map(s => s.operation.rule).join('→') === 'dig→slot-close',
     r.steps.map(s => s.operation.rule).join('→'));
-  //   C5 级联(三层):a(3)'A'@(4,8,L2) 压 b(2)'X'@(0,2,L1)(24);b 全压 a2(1)'A'@(0,2,L0)
-  //   槽内 sX(0)'X'。chain 拿 a → 揭 b(slot)→ slot-close 拿 b 与 sX 闭合 →
-  //   a2 失去遮挡 → slot-close 拿 a2 与槽内的 a 闭合 → 清盘
+  //   级联(三层):a(3)'A'@(4,8,L2) 压 b(2)'X'@(0,2,L1);b 全压 a2(1)'A'@(0,2,L0);槽内 sX(0)'X'
+  //   dig 拿 a → slot-close 拿 b 与 sX 闭合 → a2 失去遮挡 → slot-close 拿 a2 与槽内的 a 闭合
   const b5 = new Board(level(24, 20, [['X', 16, 2, 0], ['A', 0, 2, 0], ['X', 0, 2, 1], ['A', 4, 8, 2]]));
   b5.pick(0);
   const r5 = runAgent(b5, { seed: 7, decision: ladderPolicy() });
-  check('chain-slot 级联端到端:chain(slot) → slot-close → slot-close,3 pick 清盘',
+  check('端到端·级联:dig → slot-close → slot-close,3 pick 清盘',
     r5.outcome === 'cleared' && r5.picks === 3 && r5.pairsEliminated === 2
-    && r5.steps.map(s => s.operation.rule).join('→') === 'chain→slot-close→slot-close'
-    && r5.steps[0].operation.chain[0].kind === 'slot',
+      && r5.steps.map(s => s.operation.rule).join('→') === 'dig→slot-close→slot-close',
     r5.steps.map(s => s.operation.rule).join('→'));
+  //   dig 型(两张都被压):每步重估,匹配类型与消耗随挖掘推进 dig,4 → hold,3 → hold,2
+  //     z(0)'Z' 被 n(1) 压;z'(2)'Z' 被 n'(3) 压;n / n' 无伴(故意留成孤儿,终局 no_clickable)
+  const r6 = runAgent(new Board(level(24, 24, [['Z', 0, 2, 0], ['N', 0, 12, 1], ['Z', 16, 2, 0], ['N2', 16, 12, 1]])),
+    { seed: 7, decision: ladderPolicy() });
+  check('端到端·dig 型:每步重估,类型与消耗随挖掘推进(dig,4 → hold,3 → hold,2)→ slot-close 闭合',
+    r6.picks === 4 && r6.pairsEliminated === 1
+      && r6.steps.map(s => s.operation.rule).join('→') === 'dig→dig→dig→slot-close'
+      && r6.steps.slice(0, 3).map(s => `${s.operation.match.type},${s.operation.match.matchCost}`).join('→') === 'dig,4→hold,3→hold,2'
+      && r6.steps[3].paired === true,
+    r6.steps.map(s => `${s.chosenTile}:${s.operation.rule}(${s.operation.match ? s.operation.match.type + ',' + s.operation.match.matchCost : ''})`).join('→'));
 }
 
-console.log('— 平级择优:揭示预演两路求和(Σ激活 0.7 / Σ近点 0.3) —');
+console.log('— explore 梯:寻找新的潜在可能性(揭露量 > 自身风险)—');
+// 2026-11-24 设计裁定:接手「无可执行匹配」的局面,这一拿缩不了占用,就尽可能多地买信息。
+// 「可能命中槽内半张」的推断未采用;仅此一梯,空槽 1 的必败局面不单独处理。
+// 盘面几何先用探针逐一核实(见 temp/ 探针,未入库),再固化。
 {
-  // 数量效应(求和不归一):揭 3 张 pairs(3×0.8)胜揭 2 张 closes(2×1.0)
+  // A. 揭露量优先:槽内预置 X 半张、槽 3 张(空槽 1)→ X 为 hold 峰值 2,不可执行,dig 不收;
+  //    拿 m 揭出 b(X) = closes(揭露 1.0)——explore 做了一件 dig 不收的好事;u 平牌揭 0
+  //    牌:sX(0)'X' q(1)'Q' r(2)'R' → 入槽;b(3)'X'@(0,2,L0) 被 m(4)'M'@(0,10,L1) 压;u(5)'U'@(16,2,L0)
+  const bA = new Board(level(64, 24, [['X', 40, 2, 0], ['Q', 48, 2, 0], ['R', 56, 2, 0], ['X', 0, 2, 0], ['M', 0, 10, 1], ['U', 16, 2, 0]]));
+  bA.pick(0); bA.pick(1); bA.pick(2);
+  const cA = buildCtx(bA);
+  check('A 前置:空槽 1,X 为 hold 峰值 2 不可执行;前三梯均让位',
+    cA.analysis.matches.emptySlots === 1 && cA.analysis.matches.opportunities[0].type === 'hold'
+      && !cA.analysis.matches.opportunities[0].executable
+      && slotCloseRung.decide(cA) === null && pairCompleteRung.decide(cA) === null && digRung.decide(cA) === null);
+  const opA = exploreRung.decide(cA);
+  check('A 揭露量优先:取揭出 closes 的 m(揭露 1.0),不取平牌 u(揭露 0)',
+    opA !== null && opA.reason.rule === 'explore' && opA.action.tileId === 4
+      && JSON.stringify(opA.expectation.exposes) === JSON.stringify([3])
+      && opA.expectation.forecast.clickable[0].activation === 'closes');
+  check('A explore 无消耗门槛:该匹配对 dig 不可执行,explore 仍可走出它的第一步',
+    digRung.decide(cA) === null && opA.action.tileId === cA.analysis.matches.opportunities[0].cost.picks[0]);
+  // C. 全并列:全独元素平牌 → 取 tileId 小者
+  const cC = buildCtx(new Board(level(48, 14, [['U', 0, 2, 0], ['V', 8, 2, 0], ['W', 16, 2, 0], ['Y', 24, 2, 0]])));
+  const opC = exploreRung.decide(cC);
+  check('C 全并列 → 取 tileId 小者(拿 0)', opC !== null && opC.action.tileId === 0);
+}
+{
+  // B. 揭露量并列、自身风险分出先后(风险键决定胜者)
+  //    a(4)'A' 独元素 压 r(3)'R' 独元素 → 揭出 lone(0.2),a 高风险,tileId 更小
+  //    p(6)'P' 压 s(5)'S' 独元素 → 揭出 lone(0.2);p 的伴 p2(7)'P' 可见但被 q(8) 压 → 低风险
+  //    q 自身被顶层 t(9) 压住(不可点,不进候选);t 揭出 q 也是 lone(0.2) → 三者并列,由风险分出
+  //    槽 3 张(空槽 1)→ P 的 hold 不可执行
+  const bB = new Board(level(80, 36, [
+    ['S1', 56, 2, 0], ['S2', 64, 2, 0], ['S3', 72, 2, 0],
+    ['R', 0, 2, 0], ['A', 0, 10, 1],
+    ['S', 16, 2, 0], ['P', 16, 10, 1],
+    ['P', 32, 2, 0], ['Q', 32, 10, 1], ['T', 32, 18, 2],
+  ]));
+  bB.pick(0); bB.pick(1); bB.pick(2);
+  const cB = buildCtx(bB);
+  const reveals = cB.clickable.map(t => simulateReveal(t.tileId, cB.view, cB.analysis).activationSum);
+  check('B 前置:三个候选揭露量并列(均为 0.2);前三梯让位',
+    cB.clickable.map(t => t.tileId).join(',') === '4,6,9' && reveals.every(r => near(r, 0.2))
+      && slotCloseRung.decide(cB) === null && pairCompleteRung.decide(cB) === null && digRung.decide(cB) === null,
+    `可点 ${cB.clickable.map(t => t.tileId)} 揭露 ${reveals}`);
+  const opB = exploreRung.decide(cB);
+  check('B 自身风险次之:并列组里 tileId 最小的 a(4) 高风险,取低风险的 p(6)',
+    opB !== null && opB.action.tileId === 6 && opB.reason.note.includes('低风险'),
+    `pick=${opB && opB.action.tileId} note="${opB && opB.reason.note}"`);
+  // 反向盘:s/p 与 r/a 两组在数组里对调(位置不变)→ 低风险的 p 的 tileId 变成 4,仍取它
+  const bB2 = new Board(level(80, 36, [
+    ['S1', 56, 2, 0], ['S2', 64, 2, 0], ['S3', 72, 2, 0],
+    ['S', 16, 2, 0], ['P', 16, 10, 1],
+    ['R', 0, 2, 0], ['A', 0, 10, 1],
+    ['P', 32, 2, 0], ['Q', 32, 10, 1], ['T', 32, 18, 2],
+  ]));
+  bB2.pick(0); bB2.pick(1); bB2.pick(2);
+  const opB2 = exploreRung.decide(buildCtx(bB2));
+  check('B 对称盘:低风险的 p 此前 tileId 较大(6)、现在较小(4),两种排法都取它',
+    opB2 !== null && opB2.action.tileId === 4 && opB2.reason.note.includes('低风险'),
+    `pick=${opB2 && opB2.action.tileId}`);
+}
+{
+  // 端到端:盘上只剩独元素平牌时,explore 接手并拿走第一张;随后槽满判负
+  const r = runAgent(new Board(level(32, 14, [['U', 0, 2, 0], ['V', 8, 2, 0], ['W', 16, 2, 0], ['Y', 24, 2, 0]])),
+    { seed: 7, decision: ladderPolicy() });
+  check('端到端:四张互不成对的平牌 → explore 逐步拿完,4 pick 槽满判负',
+    r.outcome === 'slot_full' && r.picks === 4 && r.steps.every(s => s.operation.rule === 'explore')
+      && r.steps.map(s => s.chosenTile).join(',') === '0,1,2,3',
+    `${r.outcome} ${r.picks} ${r.steps.map(s => s.chosenTile + ':' + s.operation.rule).join('→')}`);
+  check('默认梯末位是 explore(wander 不在默认梯)',
+    defaultLadder[defaultLadder.length - 1] === exploreRung && !defaultLadder.includes(wanderRung));
+}
+
+console.log('— 拾取差分择优:同一匹配的两张牌差分不同(两张牌各预演一次)—');
+{
+  // 候选 = 可执行 double;每个匹配的两张牌各预演一次。本盘候选:P(3,7)、Q(6,8) 共四张
   //   左:a(0) b(1) c(2) 同元素 'R' 全 L0,仅被 m1(3)'P'@(4,10,L1) 骑缝压(16/16/32)
-  //   右:e(4)'S1' f(5)'S2' 仅被 m2(6)'Q'@(24,10,L1) 压(各 16);槽内有 S1/S2 → 各 closes
+  //   右:e(4)'S1' f(5)'S2' 仅被 m2(6)'Q'@(24,10,L1) 压(各 16);槽内有 S1/S2
   //   伴:m1'(7)'P'@(4,24,L1) m2'(8)'Q'@(24,24,L1) 均可点;s1(9) s2(10) 入槽
+  //   四张牌的差分(新增可执行 / 升级 / 峰值降):
+  //     拿 3(m1)  [0/2/2]:揭出 a/b/c → R: dig→double;但空槽随之 2 → 1,
+  //                         R 的 double(峰值 2)仍不可执行
+  //     拿 7(m1') [1/1/3]:什么都不揭;但槽里多了 P 的半张——再模拟 R 的挖掘时,
+  //                         m1 入槽即与手里的 7 闭对离场,R 净峰值 3 → 1,
+  //                         在余下 1 个空槽内变得可执行
+  //     拿 6(m2)  [0/3/3]:揭出 e/f → S1、S2 各 hold→close,Q double→close
+  //     拿 8(m2') [0/1/3]:什么都不揭;同上,S1/S2 的净峰值各降 1
+  //   注:[1/1/3] 体现 v4 消耗模型的既有性质——手里握着「即将要拿走的牌」的伴
+  //   会降低那次挖掘的净占用峰值(原有持牌被用于配对时净占用随之下降)
   const b = new Board(level(44, 36, [
     ['R', 0, 2, 0], ['R', 8, 2, 0], ['R', 0, 12, 0], ['P', 4, 10, 1],
     ['S1', 20, 2, 0], ['S2', 28, 2, 0], ['Q', 24, 10, 1], ['P', 4, 24, 1], ['Q', 24, 24, 1],
@@ -487,29 +581,39 @@ console.log('— 平级择优:揭示预演两路求和(Σ激活 0.7 / Σ近点 0
   ]));
   b.pick(9); b.pick(10);
   const ctx = buildCtx(b);
-  check('前置:槽 2 张(S1/S2);m1/m2 及其伴均可点;a/b/c/e/f 被压',
-    ctx.view.slot.length === 2 && [3, 6, 7, 8].every(id => ctx.clickable.some(t => t.tileId === id))
-    && [0, 1, 2, 4, 5].every(id => !ctx.clickable.some(t => t.tileId === id)));
+  const triple = d => [d.newExecutable, d.upgrades, d.peakDrop].join('/');
+  check('前置:槽 2 张(S1/S2);空槽 2;可执行 double 为 P 与 Q',
+    ctx.view.slot.length === 2 && ctx.analysis.matches.emptySlots === 2
+      && ctx.analysis.matches.opportunities.filter(o => o.type === 'double' && o.executable)
+        .map(o => o.elementId).join(',') === 'P,Q');
+  check('同一匹配的两张牌差分不同:P 的 3 → [0/2/2]、7 → [1/1/3];Q 的 6 → [0/3/3]、8 → [0/1/3]',
+    [3, 7, 6, 8].map(id => triple(pickDelta(id, ctx))).join(' ') === '0/2/2 1/1/3 0/3/3 0/1/3',
+    [3, 7, 6, 8].map(id => id + ':' + triple(pickDelta(id, ctx))).join(' '));
   const op = decideByLadder([pairCompleteRung], ctx);
-  check('数量效应:揭 3 张 pairs(m1,1.68)胜揭 2 张 closes(m2,1.40)',
-    op.action.tileId === 3 && near(op.reason.utility, 1.68)
-    && op.reason.runnerUp && op.reason.runnerUp.tileId === 6 && near(op.reason.runnerUp.score, 1.4),
-    `pick=${op.action.tileId} u=${op.reason.utility} ru=${op.reason.runnerUp?.score}`);
+  check('字典序择优:新增可执行优先 → 拿 m1\'(7)胜出;次优为 Q 里较优的 m2(6)',
+    op.action.tileId === 7 && op.reason.delta.newExecutable === 1
+      && op.reason.delta.detail.newExecIds.join(',') === 'R:dig'
+      && op.reason.runnerUp && op.reason.runnerUp.tileId === 6
+      && op.reason.utility > op.reason.runnerUp.score,
+    `pick=${op.action.tileId} delta=${JSON.stringify(op.reason.delta)} ru=${JSON.stringify(op.reason.runnerUp)}`);
 }
 {
-  // 权重比值:1 张近点(0.3)胜 1 张散牌(0.7×0.2 = 0.14)
-  //   左:mA(1)'P'@(4,10,L1) 揭 u(0)'U'@(0,2,L0)(无已知伴 → lone)
-  //   右:mB(5)'Q'@(24,12,L1) 之下 t(3)'T'@(24,2,L0) 仍被可点的 n(4)'N'@(20,2,L1) 压 → near
-  //   伴:mA'(2)'P'@(4,24,L1) mB'(6)'Q'@(24,26,L1)
-  const ctx = buildCtx(new Board(level(32, 40, [
-    ['U', 0, 2, 0], ['P', 4, 10, 1], ['P', 4, 24, 1], ['T', 24, 2, 0], ['N', 20, 2, 1],
-    ['Q', 24, 12, 1], ['Q', 24, 26, 1],
+  // 择优不受 tileId 牵制:同一匹配里揭出升级的那张胜出,即便 tileId 更大
+  //   pB(4)'P'@(32,2,L0) 不压任何牌;pA(5)'P'@(40,10,L1) 压 r(6)'R'@(40,2,L0)(32)
+  //   r'(7)'R'@(48,2,L0) 可点 → R 为 hold 型(launcher r' / target r,峰值 3)
+  //   另有平的双亮对 X(0,1)、Q(2,3)
+  //   拿 pA(5) → r 变可点,R: hold→double(升级 2);拿 pB(4) → 无升级(升级 1)
+  const ctx = buildCtx(new Board(level(56, 22, [
+    ['X', 0, 2, 0], ['X', 8, 2, 0], ['Q', 16, 2, 0], ['Q', 24, 2, 0],
+    ['P', 32, 2, 0], ['P', 40, 10, 1], ['R', 40, 2, 0], ['R', 48, 2, 0],
   ])));
   const op = decideByLadder([pairCompleteRung], ctx);
-  check('权重比值:1 张近点(mB,0.30)胜 1 张散牌(mA,0.14)',
-    op.action.tileId === 5 && near(op.reason.utility, 0.3)
-    && op.reason.runnerUp && op.reason.runnerUp.tileId === 1 && near(op.reason.runnerUp.score, 0.14),
-    `pick=${op.action.tileId} u=${op.reason.utility} ru=${op.reason.runnerUp?.score}`);
+  check('两张牌各预演一次:取揭出升级的 pA(5),tileId 更大也胜出;次优 = 同匹配的另一张 pB(4)',
+    op.action.tileId === 5 && op.reason.delta.upgrades === 2
+      && op.reason.delta.detail.upgraded.join(',') === 'P:double→close,R:hold→double'
+      && op.reason.runnerUp && op.reason.runnerUp.tileId === 4
+      && op.reason.utility > op.reason.runnerUp.score,
+    `pick=${op.action.tileId} delta=${JSON.stringify(op.reason.delta)} ru=${JSON.stringify(op.reason.runnerUp)}`);
 }
 {
   // slot-close 择优(拾取差分,2026-11-24):两个可闭对并存,其一顺带让另一匹配升级
@@ -547,7 +651,54 @@ console.log('— 平级择优:揭示预演两路求和(Σ激活 0.7 / Σ近点 0
         && sim.matches.opportunities.every(o => o.executable));
   }
 }
-// 平分确定性:对称盘 → tileId 小者(两梯各验一次)
+console.log('— pair-complete(拾取差分):候选来源 / 可执行门槛 / 匹配身份与角色无关 —');
+{
+  // 候选来源 = MatchReport 中可执行的 double 型匹配;每个匹配两张牌各预演一次
+  const ctx = buildCtx(new Board(flatLevel()));
+  const doubles = ctx.analysis.matches.opportunities.filter(o => o.type === 'double' && o.executable);
+  const op = pairCompleteRung.decide(ctx);
+  check('候选来源:平盘 4 个可执行 double(峰值均为 2 / 空槽 4)',
+    doubles.length === 4 && doubles.every(o => o.matchCost === 2)
+    && ctx.analysis.matches.emptySlots === 4);
+  check('pair-complete 出手并携带差分;reason 注明消耗 2/4 格;所拿的牌属于某个 double',
+    op !== null && op.reason.rule === 'pair-complete' && op.reason.delta !== undefined
+      && op.reason.note.includes('消耗 2/4 格')
+      && doubles.some(o => o.launcher.tileId === op.action.tileId || o.target.tileId === op.action.tileId),
+    `note="${op && op.reason.note}"`);
+  check('匹配身份与角色无关:同一对的两张牌差分完全相同(拿 0 与拿 1 均 0/1/1,E1: double→close)',
+    [0, 1].every(id => {
+      const d = pickDelta(id, ctx);
+      return d.newExecutable === 0 && d.upgrades === 1 && d.peakDrop === 1
+        && d.detail.upgraded.join(',') === 'E1:double→close'
+        && d.detail.appeared.length === 0 && d.detail.disappeared.length === 0;
+    }), `拿 0:${JSON.stringify(pickDelta(0, ctx).detail)} 拿 1:${JSON.stringify(pickDelta(1, ctx).detail)}`);
+}
+{
+  // 可执行门槛:double 的峰值为 2,空槽不足 2 时匹配不可执行 → 整梯让位
+  //   X(0) X(1) 双亮;U(2) V(3) W(4) 入槽
+  const spec = [['X', 0, 2, 0], ['X', 8, 2, 0], ['U', 16, 2, 0], ['V', 24, 2, 0], ['W', 32, 2, 0]];
+  const b1 = new Board(level(40, 14, spec));
+  b1.pick(2); b1.pick(3); b1.pick(4);
+  const ctx1 = buildCtx(b1);
+  check('空槽 1:double 不可执行(峰值 2 > 1)→ pair-complete 让位',
+    ctx1.analysis.matches.emptySlots === 1
+      && ctx1.analysis.matches.opportunities.some(o => o.elementId === 'X' && o.type === 'double' && !o.executable)
+      && pairCompleteRung.decide(ctx1) === null);
+  const b2 = new Board(level(40, 14, spec));
+  b2.pick(2); b2.pick(3);
+  const op2 = pairCompleteRung.decide(buildCtx(b2));
+  check('空槽 2:double 可执行 → pair-complete 出手', op2 !== null && op2.action.tileId === 0);
+}
+{
+  // 轨迹:defaultLadder 下 pair-complete 的操作携带差分落盘,utility = 差分标量
+  const r = runAgent(new Board(flatLevel()), { seed: 7, decision: ladderPolicy() });
+  const pc = r.steps.filter(s => s.operation.rule === 'pair-complete');
+  check('轨迹:pair-complete 各步携带 delta,utility = deltaScore(delta)',
+    pc.length === 4 && pc.every(s => s.operation.delta && s.operation.utility === deltaScore(s.operation.delta)));
+}
+// 平分确定性:对称盘 → tileId 小者。
+//   pair-complete 这条同时依赖「匹配身份与角色无关」:若按 (launcher, target) 记身份,
+//   拿 target 会被算成「新出现一个 close」而多得一次新增可执行,平局就不成立了
 {
   const opT = decideByLadder([pairCompleteRung], buildCtx(new Board(flatLevel())));
   check('pair-complete 平分取 tileId 小者(拿 0)', opT.action.tileId === 0);

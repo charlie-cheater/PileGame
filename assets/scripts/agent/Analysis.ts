@@ -16,7 +16,8 @@
 // ============================================================================
 
 import { TileDerived, UnitRect } from '../core/tile';
-import { coversAny, computeOcclusion, coverRectOf, unionArea } from '../core/Occlusion';
+import { coversAny, buildOcclusionIndex, deriveOcclusion, blockedAfter, coverRectOf, unionArea,
+  OcclusionIndex } from '../core/Occlusion';
 import { computeDepths, DepthReport } from '../core/Depth';
 import { buildOcclusionTopology } from '../core/OcclusionTopology';
 import { SLOT_COUNT } from '../core/Board';
@@ -46,6 +47,10 @@ export interface AnalysisResult {
   closureSize: Map<number, number>;
   /** 主观派生态:blocked / clickable / 逻辑矩形 */
   derived: Map<number, TileDerived>;
+  /** 遮挡关系索引(2026-11-24):感知集内「谁压着谁、压住哪块、是否侧边擦及」的结构部分,
+   *  由 derived 的同一次收集得出。消除模拟与揭示预演按「移除若干张后再判被压」
+   *  查询它(blockedAfter),不必每次全盘重算——同一次分析内各模拟共用 */
+  occlusion: OcclusionIndex;
   /** 揭露效能(独占遮挡口径;随分析产出,2026-11-23 起为子属性) */
   reveal: RevealUtility;
   /** 同类归组报告(随分析产出) */
@@ -80,7 +85,9 @@ export function analyze(view: SubjectiveView): AnalysisResult {
   }
 
   const depth = computeDepths(tiles);
-  const derived = computeOcclusion(tiles);
+  // 遮挡关系只收集一次:索引(结构)+ 派生态(由索引逐牌求面积)
+  const occlusion = buildOcclusionIndex(tiles);
+  const derived = deriveOcclusion(occlusion, tiles);
 
   // 揭露闭包:传递闭包大小(OcclusionTopology 单一事实源;DAG 无环)
   const closureSize = new Map<number, number>();
@@ -89,7 +96,7 @@ export function analyze(view: SubjectiveView): AnalysisResult {
 
   // 组装:基础结构先行,派生报告依序产出(均消费 analysis 本体;
   // groups/matches 各自内部会再调 groupByIdentity,当前规模下重算可接受)
-  const analysis = { edges, blockersOf, occludesOf, depth, closureSize, derived } as AnalysisResult;
+  const analysis = { edges, blockersOf, occludesOf, depth, closureSize, derived, occlusion } as AnalysisResult;
   analysis.reveal = revealUtility(view, edges);
   analysis.groups = groupByIdentity(view, analysis);
   analysis.matches = matchOpportunities(view, analysis);
@@ -332,6 +339,10 @@ export interface MatchCostBreakdown {
   residual: number[];
   /** 模拟的拿牌次数 */
   steps: number;
+  /** 模拟的拿牌顺序(每次拿的 tileId,含清槽阶段;长度 = steps)——完成该匹配的
+   *  执行计划。可执行性(峰值 ≤ 空槽)正是针对这套顺序得出的,决策照此执行
+   *  才能兑现(2026-11-24 新增,供 dig 梯取第一步) */
+  picks: number[];
 }
 
 export interface MatchOpportunity {
@@ -424,7 +435,8 @@ function matchOpportunities(view: SubjectiveView, analysis: AnalysisResult): Mat
     for (const id of closureOf(target.tileId)) regionSet.add(id);
     const region = [...regionSet].sort((a, b) => a - b);
 
-    const sim = simulateMatch(view, launcher.tileId, target.tileId, region, closureOf);
+    const sim = simulateMatch(view, launcher.tileId, target.tileId, region, closureOf,
+      analysis.occlusion, analysis.derived);
 
     const type: MatchType =
       launcher.inSlot && target.revealCount === 0 ? 'close'
@@ -441,6 +453,7 @@ function matchOpportunities(view: SubjectiveView, analysis: AnalysisResult): Mat
         occupancy: sim.occupancy,
         residual: sim.residual,
         steps: sim.steps,
+        picks: sim.picks,
       },
       type,
       executable: emptySlots >= sim.peak,
@@ -458,6 +471,46 @@ function matchOpportunities(view: SubjectiveView, analysis: AnalysisResult): Mat
 
 // ─────────────────────────── 消除模拟(匹配消耗的前向模型,主观) ───────────────────────────
 
+/**
+ * 模拟用的可点性状态(2026-11-24,消除模拟提速):
+ *   · 初始:各牌是否被压直接取主分析算好的 derived(不重算)
+ *   · remove(x):记入已移除集;只重算「被 x 压着、且此刻仍被压」的牌
+ *     ——x 不压的牌不受影响;已可点的牌不会变回不可点(P1 单调性)
+ *   · clickable():按 tileId 升序返回未移除且未被压的牌
+ *
+ * 与「每步在感知集 − 已移除集上跑 computeOcclusion」严格等价:
+ * 任一张牌的被压只取决于它自己的剩余遮挡者,而遮挡关系在固定盘面上不变
+ * (tests/occlusion-v3 有等价性回归)。
+ */
+function createClickTracker(
+  view: SubjectiveView,
+  occlusion: OcclusionIndex,
+  derived: Map<number, TileDerived>,
+) {
+  const removed = new Set<number>();
+  const blocked = new Map<number, boolean>();
+  for (const t of view.perceived) {
+    blocked.set(t.tileId, derived.get(t.tileId)?.blocked ?? true);
+  }
+  return {
+    removed,
+    remove(id: number): void {
+      removed.add(id);
+      for (const t of occlusion.coveredBy.get(id) ?? []) {
+        if (!blocked.get(t)) continue;
+        blocked.set(t, blockedAfter(occlusion, t, removed));
+      }
+    },
+    clickable(): number[] {
+      const ids: number[] = [];
+      for (const id of occlusion.order) {
+        if (!removed.has(id) && !blocked.get(id)) ids.push(id);
+      }
+      return ids;
+    },
+  };
+}
+
 interface MatchSimulation {
   /** 净占用峰值(= matchCost) */
   peak: number;
@@ -469,13 +522,18 @@ interface MatchSimulation {
   residual: number[];
   /** 拿牌次数 */
   steps: number;
+  /** 拿牌顺序(每次 take 的 tileId,与 steps 对应) */
+  picks: number[];
 }
 
 /**
  * 消除模拟:在主观视图上把 launcher 与 target 配掉,记账净占用峰值。
  *
- * 状态:removed = 已拿走的牌。可点性在「感知集 − removed」上重算
- * (computeOcclusion,与 simulateReveal 同一机制)——挖开一张,下面的牌才可点。
+ * 状态:removed = 已拿走的牌。可点性 =「感知集 − removed」上的被压判定。
+ * 2026-11-24 起不再每步全盘重算,改用遮挡关系索引增量维护(结果与全盘重算
+ * 严格等价,见 createClickTracker):初始状态直接取主分析算好的 derived;
+ * 此后每拿走一张牌,只有被这张牌压着的牌可能变化,且被压只会变为可点
+ * (P1 单调性)——已可点的牌不再重算。每步从约 30 次求面积降到约 2~3 次。
  * 槽内牌的身份:模拟开始时已有的取自 view.slot;模拟中拿进来的取自主观视图
  * (未识别牌以 UNKNOWN_ELEMENT 入槽,永不配对 → residual)。
  *
@@ -491,12 +549,13 @@ function simulateMatch(
   targetId: number,
   region: ReadonlyArray<number>,
   closureOf: (id: number) => number[],
+  occlusion: OcclusionIndex,
+  derived: Map<number, TileDerived>,
 ): MatchSimulation {
   const elemOf = new Map<number, string>();
   for (const t of view.perceived) elemOf.set(t.tileId, t.elementId);
   for (const s of view.slot) elemOf.set(s.tileId, s.elementId);
 
-  const removed = new Set<number>();
   /** 模拟槽:tileId 列表(保持入槽序;消除时移除) */
   const slot: number[] = [];
   /** 模拟开始时槽内已有的牌(净占用的基数) */
@@ -506,19 +565,15 @@ function simulateMatch(
 
   const occupancy: number[] = [];
   const residual: number[] = [];
+  const picks: number[] = [];
   let peak = 0;
   let steps = 0;
 
-  /** 当前主观可点牌(感知集 − removed 上重算) */
-  const clickableNow = (): number[] => {
-    const hypo = view.perceived.filter(t => !removed.has(t.tileId));
-    const derived = computeOcclusion(hypo);
-    const ids: number[] = [];
-    for (const t of hypo) {
-      if (derived.get(t.tileId)?.clickable === true) ids.push(t.tileId);
-    }
-    return ids.sort((a, b) => a - b);
-  };
+  /** 已移除集 + 各牌当前是否被压(增量维护,见 createClickTracker) */
+  const tracker = createClickTracker(view, occlusion, derived);
+  const removed = tracker.removed;
+  /** 当前主观可点牌(升序) */
+  const clickableNow = (): number[] => tracker.clickable();
 
   /** 阶段 ③:槽内同元素配对全部消除(直到无对可消) */
   const settle = (): void => {
@@ -547,7 +602,8 @@ function simulateMatch(
   /** 拿一张牌:阶段 ①②③④(只对仍在堆上的牌生效) */
   const take = (id: number): void => {
     if (!onPile(id)) return;
-    removed.add(id);
+    tracker.remove(id);
+    picks.push(id);
     slot.push(id);                            // ① 入槽占位
     const net = slot.length - base;           // ② 统计占用 —— 峰值在此读取
     occupancy.push(net);
@@ -599,28 +655,20 @@ function simulateMatch(
   }
 
   for (const id of slot) residual.push(id);
-  return { peak, preexisting, occupancy, residual, steps };
+  return { peak, preexisting, occupancy, residual, steps, picks };
 }
 
 // ─────────────────────────── 揭示预演(③决策的前向模型,主观) ───────────────────────────
-
-/** 借槽两步闭合的分类(2026-11-23 用户裁定):揭出的这张牌下一步拿走即可闭对,
- *  区别只在「与谁闭」——与槽位容量无关的结构事实,可用性门槛由决策梯另判 */
-export type ChainKind = 'slot' | 'pair';
 
 /** 预演后变可点的直接目标(逐张记激活类型) */
 export interface ForecastClickable {
   tileId: number;
   /** 激活类型(全部主观判据):
-   *  closes —— 下一步拿它即闭对(值 1.0):该元素在槽内(chain = slot),
-   *            或与本次拿的这张同元素——它入槽后即是伴(chain = pair)
+   *  closes —— 下一步拿它即闭对(值 1.0):该元素在槽内,
+   *            或与本次拿的这张同元素——它入槽后即是伴
    *  pairs  —— 该元素另有已识别牌,预演后亦可点 → 双亮对(值 0.8)
    *  lone   —— 可点但无已知可配的伴(值 0.2) */
   activation: 'closes' | 'pairs' | 'lone';
-  /** 两步闭合的分类:slot = 与槽内已有的半张闭合;pair = 与本次拿的这张闭合;
-   *  null = 不在下一步闭合范围内(激活为 pairs / lone)。
-   *  同为 slot 与 pair 时记 slot(槽内半张先闭) */
-  chain: ChainKind | null;
   /** 隐藏风险 [0,1]:预演露出的区域里代理看不到任何牌覆盖的占比——
    *  该「空白」可能是桌面,也可能是隐藏牌的顶面。**当前恒 0**(2026-11-23
    *  用户裁定:计算暂缓,另有后续计划);④后对账时可据此校准 */
@@ -657,15 +705,17 @@ const ACTIVATION_VALUE = { closes: 1.0, pairs: 0.8, lone: 0.2 } as const;
  * 揭示预演:假想移除 removed 后,它**直接覆盖**的牌里哪些会变可点(2026-11-23)。
  *
  * 口径:
- *   · 假设集合 = perceived \ {removed},在其上重算遮挡(computeOcclusion,
- *     与等价定理同一套)——像素并集口径问像素口径的问题,不混用轮次量
+ *   · 假设集合 = perceived \ {removed}。2026-11-24 起不再全盘重算:移除一张牌
+ *     只可能让它直接压着的牌(即下面的 targets)改变可点性,其余牌沿用主分析的
+ *     derived;targets 逐张查遮挡关系索引(blockedAfter),与在假设集合上重算
+ *     computeOcclusion 严格等价
  *   · 只看 occludesOf(removed) 的直接目标,不看传递闭包
  *   · clickable = 原 blocked ∧ 假设集合上 clickable;其余(暴露增加但仍被压)
  *     归 nonClickable
- *   · 激活判据(主观):closes 看槽内同元素(chain = slot),或与本次拿的这张
- *     同元素(chain = pair——它入槽后即是伴,2026-11-23 补:原实现把被拿的牌
- *     当作从游戏中消失,这类牌被误判为 lone);pairs 看感知集内同元素已识别牌
- *     且该牌在假设集合上亦可点(含「同批揭出」的双亮对)
+ *   · 激活判据(主观):closes 看槽内同元素,或与本次拿的这张同元素
+   *     (它入槽后即是伴;2026-11-23 补:原实现把被拿的牌当作从游戏中消失,
+   *     这类牌被误判为 lone);pairs 看感知集内同元素已识别牌
+   *     且该牌在假设集合上亦可点(含「同批揭出」的双亮对)
  *
  * 主观盲区(系统性、方向性):m 原盖住的像素下可能有隐藏牌顶面露出,而隐藏牌
  *   不在感知集——预演看不见,故预演的可点性是**乐观估计**(只会多估)。
@@ -679,8 +729,8 @@ export function simulateReveal(
   view: SubjectiveView,
   analysis: AnalysisResult,
 ): RevealForecast {
-  const hypo = view.perceived.filter(t => t.tileId !== removed);
-  const hypoDerived = computeOcclusion(hypo);
+  const gone = new Set<number>([removed]);
+  const occlusion = analysis.occlusion;
   const byId = new Map(view.perceived.map(t => [t.tileId, t]));
   const clickableNow = new Set<number>(
     view.perceived.filter(t => analysis.derived.get(t.tileId)?.clickable === true)
@@ -697,7 +747,7 @@ export function simulateReveal(
   const nonClickable: ForecastNonClickable[] = [];
   for (const t of targets) {
     const wasBlocked = analysis.derived.get(t)?.clickable !== true;
-    const nowClickable = hypoDerived.get(t)?.clickable === true;
+    const nowClickable = !blockedAfter(occlusion, t, gone);
     if (wasBlocked && nowClickable) {
       became.push(t);
     } else {
@@ -712,14 +762,9 @@ export function simulateReveal(
   const clickable: ForecastClickable[] = became.map(t => {
     const tile = byId.get(t);
     let activation: ForecastClickable['activation'] = 'lone';
-    let chain: ChainKind | null = null;
     if (tile && tile.elementId !== UNKNOWN_ELEMENT) {
-      if (slotElems.has(tile.elementId)) {
+      if (slotElems.has(tile.elementId) || (removedElem !== undefined && tile.elementId === removedElem)) {
         activation = 'closes';
-        chain = 'slot';
-      } else if (removedElem !== undefined && tile.elementId === removedElem) {
-        activation = 'closes';
-        chain = 'pair';
       } else {
         const identified = view.perceived.filter(p =>
           p.tileId !== t && p.tileId !== removed && p.elementId === tile.elementId);
@@ -732,7 +777,7 @@ export function simulateReveal(
         }
       }
     }
-    return { tileId: t, activation, chain, hiddenRisk: 0 };
+    return { tileId: t, activation, hiddenRisk: 0 };
   });
 
   return {

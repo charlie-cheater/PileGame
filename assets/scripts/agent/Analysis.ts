@@ -371,6 +371,8 @@ export interface MatchCostBreakdown {
    *  执行计划。可执行性(峰值 ≤ 空槽)正是针对这套顺序得出的,决策照此执行
    *  才能兑现(2026-11-24 新增,供 dig 梯取第一步) */
   picks: number[];
+  /** 胜出的拿牌策略(各策略跑一遍取峰值最小者;平分取靠前者) */
+  strategy: SimStrategy;
 }
 
 export interface MatchOpportunity {
@@ -521,6 +523,7 @@ function matchOpportunities(
           residual: sim.residual,
           steps: sim.steps,
           picks: sim.picks,
+          strategy: sim.strategy,
         },
         type,
         executable: emptySlots >= sim.peak,
@@ -602,10 +605,30 @@ interface MatchSimulation {
   steps: number;
   /** 拿牌顺序(每次 take 的 tileId,与 steps 对应) */
   picks: number[];
+  /** 胜出的拿牌策略(两组各跑一遍取峰值最小者;见 SimStrategy) */
+  strategy: SimStrategy;
 }
 
 /**
+ * 消除模拟的拿牌策略(2026-11-25 设计裁定 A+B:更好的贪心规则,在多组顺序上
+ * 各跑一遍,取峰值最小者)。单遍贪心得到的峰值依赖拿牌顺序,未必是可能的最小
+ * 消耗(实测:现状策略在约 75% 的需挖掘匹配上高于真实最小值,平均高 1.6 格)。
+ *
+ *   'dig-only'  现状:只挖闭包。挖某张牌时,其闭包内能立即闭对的成员优先,
+ *                其余按 tileId 升序
+ *   'settle-first'  能消先消:挖掘途中,若槽内**模拟带入的**牌有伴当前可点,
+ *                先拿它进来消掉(腾槽);否则同 dig-only
+ *
+ * 已否决的方向(实测):主动清「两张都可点」的同元素对——拿的多是与本次挖掘
+ * 无关的牌,且会让启动牌/目标牌各自跟第三张同元素牌配掉,得到虚假的低峰值。
+ * 两张都在闭包外的牌成对消掉,不可能降低闭包的峰值。
+ */
+export type SimStrategy = 'dig-only' | 'settle-first';
+const SIM_STRATEGIES: ReadonlyArray<SimStrategy> = ['dig-only', 'settle-first'];
+
+/**
  * 消除模拟:在主观视图上把 launcher 与 target 配掉,记账净占用峰值。
+ * 对 SIM_STRATEGIES 各跑一遍,返回峰值最小者(平分取靠前的策略;再平分取拿牌少者)。
  *
  * 状态:removed = 已拿走的牌。可点性 =「感知集 − removed」上的被压判定。
  * 2026-11-24 起不再每步全盘重算,改用遮挡关系索引增量维护(结果与全盘重算
@@ -615,13 +638,22 @@ interface MatchSimulation {
  * 槽内牌的身份:模拟开始时已有的取自 view.slot;模拟中拿进来的取自主观视图
  * (未识别牌以 UNKNOWN_ELEMENT 入槽,永不配对 → residual)。
  *
- * 拿牌优先级(确定性;模拟「一个不犯傻的玩家」):
- *   1. 挖某张牌时:其闭包内能立即闭对的成员优先,其余按 tileId 升序
- *   2. 清槽阶段:按入槽序检查槽内牌,为其找可点伴
+ * 槽内牌按来源区分(2026-11-25 设计裁定)——决定它能否在模拟中配对、去哪找伴:
+ *   · **原有的**(模拟开始时就在槽里):只在闭包内找伴。去闭包外找,等于在模拟
+ *     本次匹配的过程中夹带了一个无关的 close 操作
+ *   · **模拟带入的**(挖掘途中从闭包里拿进来的):可以去闭包外找伴——为它清槽
+ *     是挖掘的一部分(仍只找当前可点的,不找被遮盖的)
+ * 启动牌若本身是原有槽内牌(hold 型),它等待的目标牌就在闭包里,不受影响。
+ *
+ * 净占用 = 槽内总数 − 原有牌数。原有牌在模拟中只会与闭包内的牌配对,故这个
+ * 基数在过程中恒定。
+ *
+ * 不干扰本次配对:为模拟带入的牌找伴时,不拿与启动牌/目标牌同元素的牌——
+ * 否则它们可能在槽里跟第三张同元素牌配掉,而不是彼此配对。
  *
  * 逐步记账见 MatchCostBreakdown.occupancy。
  */
-function simulateMatch(
+export function simulateMatch(
   view: SubjectiveView,
   launcherId: number,
   targetId: number,
@@ -629,111 +661,172 @@ function simulateMatch(
   closureOf: (id: number) => number[],
   occlusion: OcclusionIndex,
   derived: Map<number, TileDerived>,
+  /** 只跑指定策略(测试对照用);缺省 = 全部策略取峰值最小者 */
+  only: SimStrategy | null = null,
 ): MatchSimulation {
   const elemOf = new Map<number, string>();
   for (const t of view.perceived) elemOf.set(t.tileId, t.elementId);
   for (const s of view.slot) elemOf.set(s.tileId, s.elementId);
 
-  /** 模拟槽:tileId 列表(保持入槽序;消除时移除) */
-  const slot: number[] = [];
-  /** 模拟开始时槽内已有的牌(净占用的基数) */
-  const preexisting: number[] = [];
-  for (const s of view.slot) { slot.push(s.tileId); preexisting.push(s.tileId); }
-  const base = slot.length;
+  /** 模拟开始时槽内已有的牌(净占用的基数;模拟中数量恒定或只减) */
+  const preexisting: number[] = view.slot.map(s => s.tileId);
+  const preexistingSet = new Set<number>(preexisting);
+  const base = preexisting.length;
+  const regionSet = new Set<number>(region);
+  /** 本次配对的两张牌的元素——找伴时不碰同元素的其它牌 */
+  const pairElems = new Set<string>();
+  for (const id of [launcherId, targetId]) {
+    const e = elemOf.get(id);
+    if (e !== undefined && e !== UNKNOWN_ELEMENT) pairElems.add(e);
+  }
 
-  const occupancy: number[] = [];
-  const residual: number[] = [];
-  const picks: number[] = [];
-  let peak = 0;
-  let steps = 0;
+  /** 单遍模拟:按策略 strategy 走一条拿牌轨迹 */
+  const runOnce = (strategy: SimStrategy): Omit<MatchSimulation, 'strategy'> => {
+    /** 模拟槽:tileId 列表(保持入槽序;消除时移除) */
+    const slot: number[] = preexisting.slice();
+    /** 模拟带入槽内的牌(来源标记;不在其中的即原有牌) */
+    const brought = new Set<number>();
 
-  /** 已移除集 + 各牌当前是否被压(增量维护,见 createClickTracker) */
-  const tracker = createClickTracker(view, occlusion, derived);
-  const removed = tracker.removed;
-  /** 当前主观可点牌(升序) */
-  const clickableNow = (): number[] => tracker.clickable();
+    const occupancy: number[] = [];
+    const residual: number[] = [];
+    const picks: number[] = [];
+    let peak = 0;
+    let steps = 0;
 
-  /** 阶段 ③:槽内同元素配对全部消除(直到无对可消) */
-  const settle = (): void => {
-    let paired = true;
-    while (paired) {
-      paired = false;
-      outer: for (let i = 0; i < slot.length; i++) {
-        const e = elemOf.get(slot[i]);
-        if (e === undefined || e === UNKNOWN_ELEMENT) continue;
-        for (let j = i + 1; j < slot.length; j++) {
-          if (elemOf.get(slot[j]) === e) {
+    /** 已移除集 + 各牌当前是否被压(增量维护,见 createClickTracker) */
+    const tracker = createClickTracker(view, occlusion, derived);
+    const removed = tracker.removed;
+    /** 当前主观可点牌(升序) */
+    const clickableNow = (): number[] => tracker.clickable();
+
+    /** 槽内的 x 能否与牌 y 配对(来源规则):
+     *  本次配对的 (launcher, target) → 总是可以(它们本就该配;
+     *    hold 型的 launcher 是原有牌、target 是挖出来的,正是「原有牌找闭包内的伴」);
+     *  其余:两张都是模拟带入的 → 可以;
+     *       至少一张是原有牌 → 另一张必须在闭包内(原有的只找闭包内的伴) */
+    const canPairInSim = (x: number, y: number): boolean => {
+      const xIsPair = x === launcherId || x === targetId;
+      const yIsPair = y === launcherId || y === targetId;
+      if (xIsPair || yIsPair) return xIsPair && yIsPair;      // 配对牌只跟彼此配
+      if (brought.has(x) && brought.has(y)) return true;
+      return regionSet.has(x) || regionSet.has(y);
+    };
+
+    /** 阶段 ③:槽内可配对的同元素对全部消除(直到无对可消)。
+     *  能否配对统一由 canPairInSim 判定(来源规则 + 本次配对只跟彼此配) */
+    const settle = (): void => {
+      let paired = true;
+      while (paired) {
+        paired = false;
+        outer: for (let i = 0; i < slot.length; i++) {
+          const a = slot[i];
+          const e = elemOf.get(a);
+          if (e === undefined || e === UNKNOWN_ELEMENT) continue;
+          for (let j = i + 1; j < slot.length; j++) {
+            const b = slot[j];
+            if (elemOf.get(b) !== e || !canPairInSim(a, b)) continue;
             slot.splice(j, 1);
             slot.splice(i, 1);
+            brought.delete(a);
+            brought.delete(b);
             paired = true;
             break outer;
           }
         }
       }
-    }
-  };
+    };
 
-  /** 仍在堆上的感知牌(未拿走、不在槽内) */
-  const onPile = (id: number): boolean =>
-    !removed.has(id) && !slot.some(x => x === id);
+    /** 仍在堆上的感知牌(未拿走、不在槽内) */
+    const onPile = (id: number): boolean =>
+      !removed.has(id) && !slot.some(x => x === id);
 
-  /** 拿一张牌:阶段 ①②③④(只对仍在堆上的牌生效) */
-  const take = (id: number): void => {
-    if (!onPile(id)) return;
-    tracker.remove(id);
-    picks.push(id);
-    slot.push(id);                            // ① 入槽占位
-    const net = slot.length - base;           // ② 统计占用 —— 峰值在此读取
-    occupancy.push(net);
-    if (net > peak) peak = net;
-    settle();                                 // ③ 检查匹配并消除
-    steps++;                                  // ④(占用由下次 ② 重读)
-  };
+    /** 拿一张牌:阶段 ①②③④(只对仍在堆上的牌生效) */
+    const take = (id: number): void => {
+      if (!onPile(id)) return;
+      tracker.remove(id);
+      picks.push(id);
+      slot.push(id);                            // ① 入槽占位
+      brought.add(id);                          // 模拟带入(原有的牌不经 take 入槽)
+      const net = slot.length - base;           // ② 统计占用 —— 峰值在此读取
+      occupancy.push(net);
+      if (net > peak) peak = net;
+      settle();                                 // ③ 检查匹配并消除
+      steps++;                                  // ④(占用由下次 ② 重读)
+    };
 
-  // ── 主循环:配掉 launcher 与 target ──
-  // 挖开 goal:反复拿其当前可点的闭包成员,直到 goal 可点,再拿 goal。
-  // 候选只取 goal 自己的闭包——不顺手拿别的东西。两牌共享的前置(共同路径)
-  // 在挖第二张时已不在堆上,自然只计一次。
-  const regionSet = new Set<number>(region);
-  const digAndTake = (goal: number): void => {
-    const own = new Set<number>(closureOf(goal));
-    let guard = 0;
-    while (!removed.has(goal) && guard++ < view.perceived.length + 4) {
+    /** 本次配对是否已完成:两张牌都已离场 */
+    const pairDone = (): boolean =>
+      removed.has(launcherId) && removed.has(targetId)
+      && !slot.includes(launcherId) && !slot.includes(targetId);
+
+    /** 为槽内「模拟带入的」牌找当前可点的伴(策略 settle-first 与清槽阶段共用)。
+     *  只为模拟带入的牌找——原有的槽内牌不在此清(它们的伴只在闭包内,
+     *  挖掘中该配的已在 settle 里配了)。伴可以去闭包外找,但须当前可点
+     *  (不找被遮盖的),且不与本次配对的牌同元素(避免干扰本次配对)。
+     *  按入槽序检查第一张有伴的;伴取 tileId 最小者。无则 undefined */
+    const findMateForBrought = (): number | undefined => {
       const click = clickableNow();
-      if (click.some(id => id === goal)) { take(goal); return; }
-      // 候选:可点 ∧ 属于 goal 的闭包 ∧ 属于挖掘区 ∧ 仍在堆上
-      const cands = click.filter(id => own.has(id) && regionSet.has(id) && onPile(id));
-      if (cands.length === 0) break;            // 闭包挖空仍不可点(隐藏牌所致):中止
-      // 优先拿能立即闭对的;同级 tileId 升序
-      const slotElems = new Set(slot.map(id => elemOf.get(id)));
-      const closing = cands.filter(id => slotElems.has(elemOf.get(id)));
-      take((closing.length > 0 ? closing : cands)[0]);
+      for (const x of slot) {
+        if (!brought.has(x)) continue;
+        const e = elemOf.get(x);
+        if (e === undefined || e === UNKNOWN_ELEMENT || pairElems.has(e)) continue;
+        const mate = click.find(id => onPile(id) && elemOf.get(id) === e);
+        if (mate !== undefined) return mate;
+      }
+      return undefined;
+    };
+
+    // ── 主循环:配掉 launcher 与 target ──
+    // 挖开 goal:反复拿其当前可点的闭包成员,直到 goal 可点,再拿 goal。
+    const digAndTake = (goal: number): void => {
+      const own = new Set(closureOf(goal));
+      let guard = 0;
+      while (!pairDone() && !removed.has(goal) && guard++ < view.perceived.length + 4) {
+        if (strategy === 'settle-first') {
+          const m = findMateForBrought();
+          if (m !== undefined) { take(m); continue; }
+        }
+        const click = clickableNow();
+        if (click.some(id => id === goal)) { take(goal); return; }
+        // 候选:可点 ∧ 属于 goal 的闭包 ∧ 属于挖掘区 ∧ 仍在堆上
+        const cands = click.filter(id => own.has(id) && regionSet.has(id) && onPile(id));
+        if (cands.length === 0) break;            // 闭包挖空仍不可点(隐藏牌所致):中止
+        // 优先拿能立即闭对的(须符合来源规则);同级 tileId 升序
+        const slotElems = new Set(slot.map(id => elemOf.get(id)));
+        const closing = cands.filter(id => slotElems.has(elemOf.get(id)));
+        take((closing.length > 0 ? closing : cands)[0]);
+      }
+    };
+
+    // launcher 已在槽内(模拟开始时持有的那张)则不再入槽——它的占位是既成事实
+    if (!preexistingSet.has(launcherId)) digAndTake(launcherId);
+    digAndTake(targetId);
+
+    // ── 清槽:为「模拟带入的」槽内牌找当前可点的伴(可去闭包外) ──
+    // 原有的槽内牌不在此清——它们的伴只在闭包内,挖掘过程中该配的已在 settle 里配了
+    let acted = true;
+    let guard = 0;
+    while (acted && guard++ < view.perceived.length + 4) {
+      acted = false;
+      const m = findMateForBrought();
+      if (m !== undefined) { take(m); acted = true; }
     }
+
+    for (const id of slot) residual.push(id);
+    return { peak, preexisting, occupancy, residual, steps, picks };
   };
 
-  // launcher 已在槽内(模拟开始时持有的那张)则不再入槽——它的占位是既成事实
-  if (!preexisting.some(id => id === launcherId)) digAndTake(launcherId);
-  digAndTake(targetId);
-
-  // ── 清槽:槽内出不去的牌,只在槽内与当前可点牌中找伴 ──
-  let acted = true;
-  let guard = 0;
-  while (acted && guard++ < view.perceived.length + 4) {
-    acted = false;
-    const click = clickableNow();
-    // 按入槽序逐张检查(每轮重读,消除后序号变化)
-    for (let i = 0; i < slot.length; i++) {
-      const x = slot[i];
-      const e = elemOf.get(x);
-      if (e === undefined || e === UNKNOWN_ELEMENT) continue;
-      // 槽内已有伴 → settle 已处理(或本轮稍后处理);只找可点伴
-      const mate = click.find(id => onPile(id) && elemOf.get(id) === e);
-      if (mate !== undefined) { take(mate); acted = true; break; }
+  // ── A+B:各策略跑一遍,取峰值最小者 ──
+  let best: MatchSimulation | null = null;
+  for (const strategy of only ? [only] : SIM_STRATEGIES) {
+    const r = runOnce(strategy);
+    if (best === null
+        || r.peak < best.peak
+        || (r.peak === best.peak && r.steps < best.steps)) {
+      best = { ...r, strategy };
     }
   }
-
-  for (const id of slot) residual.push(id);
-  return { peak, preexisting, occupancy, residual, steps, picks };
+  return best!;
 }
 
 // ─────────────────────────── 揭示预演(③决策的前向模型,主观) ───────────────────────────

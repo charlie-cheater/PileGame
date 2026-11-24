@@ -21,7 +21,7 @@ const { fillSlots } = require('../temp/v3check/core/RandomFill');
 const { buildMahjongElements } = require('../temp/v3check/core/MahjongSet');
 const { lcg } = require('../temp/v3check/core/LevelBuilder');
 const { perceive, UNKNOWN_ELEMENT } = require('../temp/v3check/agent/Perception');
-const { analyze, analyzeStructure, simulateReveal } = require('../temp/v3check/agent/Analysis');
+const { analyze, analyzeStructure, simulateMatch, simulateReveal } = require('../temp/v3check/agent/Analysis');
 const { decideByLadder, defaultLadder } = require('../temp/v3check/agent/Ladder');
 
 let pass = 0, fail = 0;
@@ -451,15 +451,20 @@ console.log('— 分析扩展:匹配消耗 v4(消除模拟的净占用峰值)—
       && t5.cost.residual.join(',') === '2,3' && t5.cost.steps === 4,
     `occ=${seq(t5)} peak=${t5.matchCost} res=${t5.cost.residual.join(',')}`);
 
-  // T5b 回归:挖 target 时不得顺手拿 launcher 的遮挡者;launcher 自己被压时须先挖开
-  //   launcher L 被 a 压、target T 被 b 压;a 的伴可点(清槽阶段能走),b 的伴不可见
-  {
-    const o = opOf([mkS(0, 'e', 0, 10, 0), mkS(1, 'e', 30, 10, 0), mkS(2, 'a', 0, 10, 1),
-      mkS(3, 'b', 30, 10, 1), mkS(4, 'a', 40, 10, 0)]);
-    check('T5b 先挖 launcher 再挖 target:拿 a(1)→ 拿 L(2)→ 拿 b(3)→ 拿 T(4)→ 消 → 清槽拿 a 伴(3)→ 消;峰值 4',
-      seq(o) === '1,2,3,4,3' && o.matchCost === 4 && o.cost.residual.join(',') === '3' && o.cost.steps === 5,
-      `occ=${seq(o)} peak=${o.matchCost} res=${o.cost.residual.join(',')}`);
-  }
+    // T5b 回归:挖 target 时不得顺手拿 launcher 的遮挡者;launcher 自己被压时须先挖开
+    //   launcher L 被 a 压、target T 被 b 压;a 的伴(4)可点,b 的伴不可见
+    //   2026-11-25 起两组策略取最小:settle-first 拿 a 之后立刻把它的伴 4 拿进来消掉
+    //   (a 是「模拟带入的」牌,可去闭包外找伴),占用 2 → 1,峰值由 4 降到 3:
+    //     拿 a(1)→ 拿 L(2)→ 拿 4(1,a 与 4 消)→ 拿 b(2)→ 拿 T(3,与 L 消)→ b 出不去
+    //   原注释要防的两件事仍成立:先挖 launcher、没顺手拿 b(b 留在剩余)
+    {
+      const o = opOf([mkS(0, 'e', 0, 10, 0), mkS(1, 'e', 30, 10, 0), mkS(2, 'a', 0, 10, 1),
+        mkS(3, 'b', 30, 10, 1), mkS(4, 'a', 40, 10, 0)]);
+      check('T5b 先挖 launcher 再挖 target:settle-first 边挖边消 → 拿 a(1)→ 拿 L(2)→ 拿 a 伴(1)→ 拿 b(2)→ 拿 T(3)→ 消;峰值 3;b 留剩余',
+        o.cost.strategy === 'settle-first' && seq(o) === '1,2,1,2,3' && o.matchCost === 3
+          && o.cost.residual.join(',') === '3' && o.cost.steps === 5,
+        `策略 ${o.cost.strategy} occ=${seq(o)} peak=${o.matchCost} res=${o.cost.residual.join(',')} picks=${o.cost.picks.join(',')}`);
+    }
 
   // T6 共同路径:顶层牌同压两张配对牌 → 共享前置只占 1 格
   const t6 = opOf([mkS(0, 'e', 0, 10, 0), mkS(1, 'e', -14, 10, 0), mkS(2, 'z', -7, 2, 1)]);
@@ -737,8 +742,20 @@ console.log('— 结果层等价性回归:新模拟 ⇔ 旧的逐步全盘重算
   };
 
   const mkEls = n => Array.from({ length: n }, (_, i) => ({ elementId: 'u' + (i + 1), displayName: 'e', color: '#fff' }));
-  const S = { steps: 0, entries: 0, simSteps: 0, withResidual: 0, launcherInSlot: 0, badSim: 0, firstBad: '',
+  const S = { steps: 0, entries: 0, simSteps: 0, withResidual: 0, launcherInSlot: 0,
+    emptySlotEntries: 0, badDigOnlyEmpty: 0, firstBadDigOnlyEmpty: '',     // 槽空局面:dig-only vs 旧参照
+    preEntries: 0, aboveLegacy: 0, firstAbove: '',                         // 槽内有原有牌(信息):报告峰值高于旧参照的条数
+    notClickable: 0, firstNotClickable: '',                                // picks 里有拿时不可点的牌
+    replayMismatch: 0, firstReplayMismatch: '',                            // 重放峰值 ≠ 报告峰值
+    pairNotTogether: 0, firstPairNotTogether: '',                          // 计划走完后 launcher/target 没互相配掉
+    badMin: 0, firstBadMin: '',                                             // 报告峰值 = min(两组策略)
+    settleWins: 0,
     reveals: 0, badReveal: 0, minTiles: Infinity, maxTiles: 0 };
+  const fieldEq = (r, s) => r.peak === s.peak
+    && JSON.stringify(r.occupancy) === JSON.stringify(s.occupancy)
+    && JSON.stringify(r.residual) === JSON.stringify(s.residual)
+    && r.steps === s.steps
+    && JSON.stringify(r.picks) === JSON.stringify(s.picks);
   // 用默认梯跑真实对局(覆盖开局到残局;7/14/35 元素各取数局)
   for (const [n, games] of [[7, 3], [14, 2], [35, 1]]) {
     for (let g = 0; g < games; g++) {
@@ -753,25 +770,96 @@ console.log('— 结果层等价性回归:新模拟 ⇔ 旧的逐步全盘重算
         if (click.length === 0) break;
         S.steps++; S.minTiles = Math.min(S.minTiles, view.perceived.length); S.maxTiles = Math.max(S.maxTiles, view.perceived.length);
 
-        // ① 每条匹配:用旧模拟重跑,比较全部产出
+        // ① 每条匹配:与旧参照(2026-11-24 之前的实现,逐字保留)对照。
+        //    2026-11-25 起消除模拟有两处设计变更,与旧参照不再逐字段等价:
+        //      · 来源规则:模拟开始时槽内原有的牌只与闭包内的牌配对(旧实现会给它们找闭包外的可点伴)
+        //      · 两组贪心取最小:新增 settle-first 策略(挖掘途中先把「模拟带入的牌」的可点伴拿来消掉)
+        //    故等价性只在**槽空**的局面上成立(此时 dig-only 策略 = 旧实现);
+        //    槽内有原有牌时只要求「不劣于旧参照」。
         const closureOf = closureIndexOf(a);
         for (const o of a.matches.opportunities) {
           S.entries++; S.simSteps += o.cost.steps;
           if (o.cost.residual.length > 0) S.withResidual++;
           if (o.launcher.inSlot) S.launcherInSlot++;
           const ref = legacySimulateMatch(view, o.launcher.tileId, o.target.tileId, o.cost.region, closureOf);
-          const same = ref.peak === o.matchCost
-            && JSON.stringify(ref.preexisting) === JSON.stringify(o.cost.preexisting)
-            && JSON.stringify(ref.occupancy) === JSON.stringify(o.cost.occupancy)
-            && JSON.stringify(ref.residual) === JSON.stringify(o.cost.residual)
-            && ref.steps === o.cost.steps
-            && JSON.stringify(ref.picks) === JSON.stringify(o.cost.picks);
-          if (!same) {
-            S.badSim++;
-            if (!S.firstBad) S.firstBad = `${o.elementId} ${o.type}: 峰值 ${ref.peak}/${o.matchCost} 占用 ${ref.occupancy}/${o.cost.occupancy} `
-              + `剩余 ${ref.residual}/${o.cost.residual} 计划 ${ref.picks}/${o.cost.picks}`;
+          const digOnly = simulateMatch(view, o.launcher.tileId, o.target.tileId, o.cost.region, closureOf, a.occlusion, a.derived, 'dig-only');
+          const settle = simulateMatch(view, o.launcher.tileId, o.target.tileId, o.cost.region, closureOf, a.occlusion, a.derived, 'settle-first');
+
+          // (a) 报告峰值 = 两组策略的较小者;平分取 dig-only(靠前)
+          const expectStrategy = settle.peak < digOnly.peak ? 'settle-first' : 'dig-only';
+          const minOk = o.matchCost === Math.min(digOnly.peak, settle.peak) && o.cost.strategy === expectStrategy;
+          if (!minOk) {
+            S.badMin++;
+            if (!S.firstBadMin) S.firstBadMin = `${o.elementId} ${o.type}: 报告 ${o.matchCost}/${o.cost.strategy} · dig-only ${digOnly.peak} · settle-first ${settle.peak}`;
           }
-        }
+          if (o.cost.strategy === 'settle-first') S.settleWins++;
+
+          if (view.slot.length === 0) {
+            // (b) 槽空:dig-only 与旧参照逐字段一致
+            S.emptySlotEntries++;
+            if (!fieldEq(ref, digOnly)) {
+              S.badDigOnlyEmpty++;
+              if (!S.firstBadDigOnlyEmpty) S.firstBadDigOnlyEmpty = `${o.elementId} ${o.type}: 峰值 ${digOnly.peak}/${ref.peak} 占用 ${digOnly.occupancy}/${ref.occupancy} `
+                + `剩余 ${digOnly.residual}/${ref.residual} 计划 ${digOnly.picks}/${ref.picks}`;
+            }
+          } else {
+            // (c) 槽内有原有牌:来源规则 —— 原有牌只跟闭包内的牌配(2026-11-25 设计裁定)。
+            //     重放 picks,逐组结算记录「谁跟谁配了」:
+            //       · 原有牌若离场,配对对象必须在闭包内(启动牌例外:它配的是目标牌)
+            //       · 本次配对的 launcher/target 只跟彼此配
+            //     与旧参照相比报告峰值可能更高:旧实现在算「49 配 67」时会顺手把槽内
+            //     原有的同元素牌 36 跟 49 消掉 —— 那是另一次配对,不该算进这次。
+              S.preEntries++;
+              // 按 picks 重放,结算遵循来源规则(与被测实现同口径):
+              //   · 本次配对的 launcher / target 只跟彼此配
+              //   · 原有槽内牌只跟闭包内的牌配;模拟带入的牌可跟任何同元素牌配
+              // 重放能独立验证的是:① 每张牌拿的时候可点;② 重放峰值 = 报告峰值;
+              // ③ 计划走完后 launcher 与 target 确实互相配掉。
+              // (规则本身是否正确由专门构造的用例钉,不靠这段重放 —— 重放逻辑与实现同源。)
+              const pre = view.slot.map(s => s.tileId);
+              const preSet = new Set(pre);
+              const elemOfP = new Map(view.perceived.map(t => [t.tileId, t.elementId]));
+              for (const s of view.slot) elemOfP.set(s.tileId, s.elementId);
+              const regionSet = new Set(o.cost.region);
+              const L = o.launcher.tileId, T = o.target.tileId;
+              const replaySlot = pre.slice();
+              const brought = new Set();
+              const takenSet = new Set();
+              let pairDoneTogether = false;
+              const mayPair = (x, y) => {
+                const xP = x === L || x === T, yP = y === L || y === T;
+                if (xP || yP) return xP && yP;
+                if (brought.has(x) && brought.has(y)) return true;
+                return regionSet.has(x) || regionSet.has(y);
+              };
+              const settleReplay = () => {
+                let paired = true;
+                while (paired) {
+                  paired = false;
+                  outer: for (let i = 0; i < replaySlot.length; i++) for (let j = i + 1; j < replaySlot.length; j++) {
+                    const x = replaySlot[i], y = replaySlot[j];
+                    const ex = elemOfP.get(x);
+                    if (ex === undefined || ex === UNKNOWN_ELEMENT || elemOfP.get(y) !== ex || !mayPair(x, y)) continue;
+                    if ((x === L && y === T) || (x === T && y === L)) pairDoneTogether = true;
+                    replaySlot.splice(j, 1); replaySlot.splice(i, 1); brought.delete(x); brought.delete(y);
+                    paired = true; break outer;
+                  }
+                }
+              };
+              let replayPeak = 0;
+              for (const id of o.cost.picks) {
+                const hypo = view.perceived.filter(t => !takenSet.has(t.tileId));
+                if (computeOcclusion(hypo).get(id)?.clickable !== true) { S.notClickable++; if (!S.firstNotClickable) S.firstNotClickable = `${o.elementId} ${o.type}: picks 中 ${id} 拿时不可点`; }
+                takenSet.add(id);
+                replaySlot.push(id); brought.add(id);
+                replayPeak = Math.max(replayPeak, replaySlot.length - pre.length);
+                settleReplay();
+              }
+              if (replayPeak !== o.matchCost) { S.replayMismatch++; if (!S.firstReplayMismatch) S.firstReplayMismatch = `${o.elementId} ${o.type}: 重放峰值 ${replayPeak} ≠ 报告 ${o.matchCost} 占用 ${JSON.stringify(o.cost.occupancy)} 计划 ${JSON.stringify(o.cost.picks)}`; }
+              if (!pairDoneTogether) { S.pairNotTogether++; if (!S.firstPairNotTogether) S.firstPairNotTogether = `${o.elementId} ${o.type}: 计划走完后 ${L} 与 ${T} 没有互相配掉(计划 ${JSON.stringify(o.cost.picks)})`; }
+              if (o.matchCost > ref.peak) { S.aboveLegacy++; if (!S.firstAbove) S.firstAbove = `${o.elementId} ${o.type}: 报告 ${o.matchCost} > 旧参照 ${ref.peak}`; }
+            }
+          }
 
         // ② 揭示预演:拿走每张可点牌后「哪些直接目标变可点」——旧法在假设集合上全盘重算
         const picksToTest = click.length <= 4 ? click : [click[0], click[1], click[click.length - 2], click[click.length - 1]];
@@ -795,8 +883,20 @@ console.log('— 结果层等价性回归:新模拟 ⇔ 旧的逐步全盘重算
   }
   console.log(`    样本:${S.steps} 步(盘面 ${S.minTiles}~${S.maxTiles} 张)· 匹配条目 ${S.entries} 条、共 ${S.simSteps} 个模拟步`
     + `(其中结束时有遗留牌的 ${S.withResidual} 条、启动牌在槽内的 ${S.launcherInSlot} 条)· 揭示预演 ${S.reveals} 次`);
-  check('消除模拟:新实现与旧的逐步全盘重算逐条目、逐字段一致(峰值/占用序列/剩余牌/步数/拿牌顺序)',
-    S.badSim === 0, `${S.badSim} 条不一致;首例:${S.firstBad}`);
+  console.log(`    对照旧参照:槽空局面 ${S.emptySlotEntries} 条 · 槽内有原有牌 ${S.preEntries} 条 · settle-first 胜出 ${S.settleWins} 条`
+    + ` · 槽内有原有牌时报告峰值高于旧参照 ${S.aboveLegacy} 条(来源规则:原有牌不陪闭包外的牌消,属预期)`);
+  check('报告峰值 = min(dig-only, settle-first),平分取 dig-only',
+    S.badMin === 0, `${S.badMin} 条不一致;首例:${S.firstBadMin}`);
+  check('槽空局面:dig-only 策略与旧的逐步全盘重算逐字段一致(峰值/占用序列/剩余牌/步数/拿牌顺序)',
+    S.badDigOnlyEmpty === 0, `${S.badDigOnlyEmpty}/${S.emptySlotEntries} 条不一致;首例:${S.firstBadDigOnlyEmpty}`);
+  check('picks 可执行:计划里每张牌拿的时候都可点',
+    S.notClickable === 0, `${S.notClickable} 次;首例:${S.firstNotClickable}`);
+  check('picks 重放得到的峰值 = 报告的 matchCost(按来源规则结算)',
+    S.replayMismatch === 0, `${S.replayMismatch} 条不一致;首例:${S.firstReplayMismatch}`);
+  check('计划走完后启动牌与目标牌确实互相配掉(不是各自跟第三张同元素牌配)',
+    S.pairNotTogether === 0, `${S.pairNotTogether} 条;首例:${S.firstPairNotTogether}`);
+  check('两处设计变更都实际被触发:有槽内有原有牌的样本,且有 settle-first 胜出的样本',
+    S.preEntries > 0 && S.settleWins > 0, `槽内 ${S.preEntries} · settle-first ${S.settleWins}`);
   check('样本量足够(≥ 200 步、≥ 1000 条匹配、覆盖残局)',
     S.steps >= 200 && S.entries >= 1000 && S.minTiles <= 10, JSON.stringify(S));
   check('揭示预演:拿走一张后变可点的直接目标,与在假设集合上全盘重算一致',
@@ -835,8 +935,19 @@ console.log('— MatchReport 配对保留口径(2026-11-24:两张都能直接拿
   check('byElement 恰有这 4 个元素,槽内那张(0)不单独成条目',
     [...m.byElement.keys()].sort().join(',') === 'e1,e2,e3,e4'
     && m.byElement.get('Xa') === undefined, [...m.byElement.keys()].join(','));
-  check('槽内 1 张 + 可点 2 张:close ×2 + double ×1 全部保留',
-    shape('e1') === 'close(0,1) close(0,2) double(1,2)', shape('e1'));
+    check('槽内 1 张 + 可点 2 张:close ×2 + double ×1 全部保留',
+      shape('e1') === 'close(0,1) close(0,2) double(1,2)', shape('e1'));
+    {
+      const e1 = of('e1');
+      const closeTo1 = e1.find(o => o.type === 'close' && o.target.tileId === 1);
+      const closeTo2 = e1.find(o => o.type === 'close' && o.target.tileId === 2);
+      const dbl = e1.find(o => o.type === 'double');
+      check('来源规则:槽内原有 0 号不陪 double(1,2) 消 —— close 峰值 1、double 峰值 2',
+        !!closeTo1 && closeTo1.matchCost === 1
+        && !!closeTo2 && closeTo2.matchCost === 1
+        && !!dbl && dbl.matchCost === 2 && dbl.cost.occupancy.join(',') === '1,2',
+        e1.map(o => `${o.type}:${o.matchCost}:${o.cost.occupancy}`).join(' '));
+    }
   check('可点 3 张:double ×3 全部保留',
     shape('e4') === 'double(14,15) double(14,16) double(15,16)', shape('e4'));
   check('可点 1 张 + 被压 2 张:只留最便宜的一对(hold,目标 = 闭包小的那张 9)',
@@ -851,7 +962,7 @@ console.log('— MatchReport 配对保留口径(2026-11-24:两张都能直接拿
     `${m.opportunities.length} 对 ${[...m.byElement.values()].reduce((s, a) => s + a.length, 0)}`);
   check('排序:消耗升序 → elementId → 启动牌 → 目标牌',
     m.opportunities.map(o => `${o.elementId}:${o.type}:${o.matchCost}`).join(' ')
-      === 'e1:close:1 e1:close:1 e1:double:1 e4:double:2 e4:double:2 e4:double:2 e3:hold:3 e2:dig:5',
+      === 'e1:close:1 e1:close:1 e1:double:2 e4:double:2 e4:double:2 e4:double:2 e3:hold:3 e2:dig:5',
     m.opportunities.map(o => `${o.elementId}:${o.type}:${o.matchCost}`).join(' '));
 }
 

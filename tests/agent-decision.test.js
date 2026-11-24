@@ -422,9 +422,15 @@ console.log('— dig 梯(基础数据选择):候选来源 / 排序占位 / 动�
     op !== null && op.reason.rule === 'dig' && op.action.tileId === 6
       && JSON.stringify(op.reason.match) === JSON.stringify({ elementId: 'X', type: 'hold', launcher: 4, target: 5, matchCost: 2 }),
     `pick=${op && op.action.tileId} match=${JSON.stringify(op && op.reason.match)}`);
-  check('reason 注明消耗与空槽数、计划步数',
-    op.reason.note.includes('消耗 2/2 格') && op.reason.note.includes('计划 3 步'),
-    `note="${op.reason.note}"`);
+    // 2026-11-25 来源规则:模拟开始时槽内原有的牌只跟闭包内的牌配。
+    //   旧实现在算 X 的 hold 时,会顺手把槽内原有的 0(U)跟可点的 1(U)消掉 ——
+    //   那是 U 的 close,混进了 X 的账里,计划因此多出 2 步。现在不消,计划只剩 2 步。
+    check('reason 注明消耗与空槽数、计划步数',
+      op.reason.note.includes('消耗 2/2 格') && op.reason.note.includes('计划 2 步'),
+      `note="${op.reason.note}"`);
+    check('来源规则:X 的计划只含挖掘动作(拿 6 挖开 5 → 拿 5 与槽内 4 配),不夹带原有槽内牌 0 的配对',
+      JSON.stringify(ctx.analysis.matches.byElement.get('X')[0].cost.picks) === '[6,5]',
+      `picks=${JSON.stringify(ctx.analysis.matches.byElement.get('X')[0].cost.picks)}`);
 }
 {
   // DG2 排序(占位):暂取 MatchReport 既有顺序——消耗升序
@@ -587,44 +593,11 @@ console.log('— explore 梯:寻找新的潜在可能性(揭露量 > 自身风�
 }
 
 console.log('— 拾取差分择优:同一匹配的两张牌差分不同(两张牌各预演一次)—');
-{
-  // 候选 = 可执行 double;每个匹配的两张牌各预演一次。本盘候选:P(3,7)、Q(6,8) 共四张
-  //   左:a(0) b(1) c(2) 同元素 'R' 全 L0,仅被 m1(3)'P'@(4,10,L1) 骑缝压(16/16/32)
-  //   右:e(4)'S1' f(5)'S2' 仅被 m2(6)'Q'@(24,10,L1) 压(各 16);槽内有 S1/S2
-  //   伴:m1'(7)'P'@(4,24,L1) m2'(8)'Q'@(24,24,L1) 均可点;s1(9) s2(10) 入槽
-  //   四张牌的差分(新增可执行 / 升级 / 峰值降):
-  //     拿 3(m1)  [0/2/2]:揭出 a/b/c → R: dig→double;但空槽随之 2 → 1,
-  //                         R 的 double(峰值 2)仍不可执行
-  //     拿 7(m1') [1/1/3]:什么都不揭;但槽里多了 P 的半张——再模拟 R 的挖掘时,
-  //                         m1 入槽即与手里的 7 闭对离场,R 净峰值 3 → 1,
-  //                         在余下 1 个空槽内变得可执行
-  //     拿 6(m2)  [0/3/3]:揭出 e/f → S1、S2 各 hold→close,Q double→close
-  //     拿 8(m2') [0/1/3]:什么都不揭;同上,S1/S2 的净峰值各降 1
-  //   注:[1/1/3] 体现 v4 消耗模型的既有性质——手里握着「即将要拿走的牌」的伴
-  //   会降低那次挖掘的净占用峰值(原有持牌被用于配对时净占用随之下降)
-  const b = new Board(level(44, 36, [
-    ['R', 0, 2, 0], ['R', 8, 2, 0], ['R', 0, 12, 0], ['P', 4, 10, 1],
-    ['S1', 20, 2, 0], ['S2', 28, 2, 0], ['Q', 24, 10, 1], ['P', 4, 24, 1], ['Q', 24, 24, 1],
-    ['S1', 36, 2, 0], ['S2', 36, 12, 0],
-  ]));
-  b.pick(9); b.pick(10);
-  const ctx = buildCtx(b);
-  const triple = d => [d.newExecutable, d.upgrades, d.peakDrop].join('/');
-  check('前置:槽 2 张(S1/S2);空槽 2;可执行 double 为 P 与 Q',
-    ctx.view.slot.length === 2 && ctx.analysis.matches.emptySlots === 2
-      && ctx.analysis.matches.opportunities.filter(o => o.type === 'double' && o.executable)
-        .map(o => o.elementId).join(',') === 'P,Q');
-  check('同一匹配的两张牌差分不同:P 的 3 → [0/2/2]、7 → [1/1/3];Q 的 6 → [0/3/3]、8 → [0/1/3]',
-    [3, 7, 6, 8].map(id => triple(pickDelta(id, ctx))).join(' ') === '0/2/2 1/1/3 0/3/3 0/1/3',
-    [3, 7, 6, 8].map(id => id + ':' + triple(pickDelta(id, ctx))).join(' '));
-  const op = decideByLadder([pairCompleteRung], ctx);
-  check('字典序择优:新增可执行优先 → 拿 m1\'(7)胜出;次优为 Q 里较优的 m2(6)',
-    op.action.tileId === 7 && op.reason.delta.newExecutable === 1
-      && op.reason.delta.detail.newExecIds.join(',') === 'R:dig'
-      && op.reason.runnerUp && op.reason.runnerUp.tileId === 6
-      && op.reason.utility > op.reason.runnerUp.score,
-    `pick=${op.action.tileId} delta=${JSON.stringify(op.reason.delta)} ru=${JSON.stringify(op.reason.runnerUp)}`);
-}
+// 注:本段原有一个盘面(三张 R 被一张 P 骑缝压;另有一张可点的 P 与槽内 S1/S2),
+//   用于验证「手里握着闭包内某牌的伴,会降低那次挖掘的峰值 → 拿它使匹配变得可执行」。
+//   2026-11-25 消除模拟改为两组贪心取最小(dig-only / settle-first)后,R 在拿那张 P
+//   之前峰值即为 2、本就可执行,该盘面的前提不再成立,三条断言随之移除。
+//   该机制本身未变:原有槽内牌与闭包内的牌仍可配对(见 agent-perception 的来源规则测试)。
 {
   // 择优不受 tileId 牵制:同一匹配里揭出升级的那张胜出,即便 tileId 更大
   //   pB(4)'P'@(32,2,L0) 不压任何牌;pA(5)'P'@(40,10,L1) 压 r(6)'R'@(40,2,L0)(32)

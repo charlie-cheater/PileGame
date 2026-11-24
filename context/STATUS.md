@@ -1,7 +1,7 @@
 # 项目状态快照
 
 > **会话入口文档**。进入会话先读此文件,离开会话务必同步更新。
-> 最后更新:2026-11-23(第三会话归档:②分析收敛 + ③决策扫描梯 v1;「需更多资源的 match」建模方案待评审)
+> 最后更新:2026-11-24(第五会话归档:拾取差分 + 第一阶梯 slot-close 改用差分择优)
 
 ## 基本信息
 
@@ -10,18 +10,20 @@
 - **平台**:微信小游戏;竖屏 750×1624(设计分辨率已写入工程)
 - **设计北极星**:情绪锚点 → [map/nodes/emotional-anchor.md](map/nodes/emotional-anchor.md)
 - **设计现状总览(认知地图)**:[map/MAP.md](map/MAP.md)
-- **Git**:远程 github.com/charlie-cheater/PileGame(SSH);主干 `master`(首提交 `9907cce`,副本重建);③决策阶段的工作提交在分支 `agent-decision-ladder`(未合并、未推送)
+- **Git**:远程 github.com/charlie-cheater/PileGame(SSH);主干 `master`(首提交 `9907cce`,副本重建);③决策阶段的工作在分支 `agent-decision-ladder`(第四、五会话的改动已提交并推送至该分支;**未合并到 master**)
 
-## 当前阶段:P3 · 关卡生成算法设计 —— 仿真代理 ①②③④ 迭代中:②分析已收敛为单一入口,③决策扫描梯 v1 落地 🟡;「需更多资源的 match」建模方案待评审;⑤预期对账与规划器未动工
+## 当前阶段:P3 · 关卡生成算法设计 —— 仿真代理 ①②③④ 迭代中:②分析已收敛,匹配消耗 = 消除模拟的净占用峰值;③决策逐梯改造中(第一阶梯 slot-close 已改用拾取差分择优)🟡;⑤预期对账与规划器未动工
 
 ## 已完成(P3)
 
 - [x] **设计方向确认**(2026-11-21):求解器定位为**仿真玩家代理 × 渐进式规划器**(EDPCG 脉络),否定传统验证性求解器为目标;现阶段配对形态锁定**全图匹配(FULL)**,元素重复度成为内容主轴 → [map/nodes/level-generation.md](map/nodes/level-generation.md)
 - [x] **遮挡口径 v3**(2026-11-22 设计裁定):blocked = 覆盖并集 > 18% 或跨层侧边擦及;成对谓词拆分 coversAny/pressesOn;**等价定理**:感知子集重算 = 真值,可见遮挡 ⇔ 不可点
-- [x] **仿真求解器第一里程碑**(2026-11-23,`assets/scripts/agent/`):①感知(可见像素边界/识别阈值 0.25/身份遮蔽)②分析(遮挡关系/深度/揭露闭包/可点性、同类归组、揭露效能·独占遮挡、**匹配消耗 v2.2**:启动牌×目标牌、槽内 = 0 成本启动牌、获取成本 = 1 + (闭包+深度)/2)③决策(随机 + 见对先拿对照,seed 可重放)④操作(Runner 执行循环+轨迹);随机填充语料(RandomFill)+ 编辑器选中交互 debug;测试三套 76 项全绿(tests/,盘面统一 test_layout.json + seed 7)
+- [x] **仿真求解器第一里程碑**(2026-11-23,`assets/scripts/agent/`):①感知(可见像素边界/识别阈值 0.25/身份遮蔽)②分析(遮挡关系/深度/揭露闭包/可点性、同类归组、揭露效能·独占遮挡、匹配消耗 **v2.2**:启动牌×目标牌、槽内 = 0 成本启动牌、获取成本 = 1 + (闭包+深度)/2 ⛔ *2026-11-24 被 v4 取代*)③决策(随机 + 见对先拿对照,seed 可重放)④操作(Runner 执行循环+轨迹);随机填充语料(RandomFill)+ 编辑器选中交互 debug;测试三套 76 项全绿(tests/,盘面统一 test_layout.json + seed 7)
 - [x] **背景研究归档**:可解性/验证算法(NP-completeness 谱系、P1/P2/P3 结构性质、de Bondt 技术阶梯、性能注意)→ [background/solvability-research.md](background/solvability-research.md);玩家仿真代理学术脉络与设计素材 → [background/player-model-research.md](background/player-model-research.md)
-- [x] **分析数据深化**(2026-11-23 第二会话):揭露效能 v1.6 **独占面积数据**(ExclusiveCover pair 分布 + area/maxArea 标量,主观口径零成本);匹配消耗 v2.3 递归定价全程探索(四轮口径裁定 → acquireCostR/matchCostR 另档接线,v2.2 值不覆盖)后实测分化过剧(dig 均值 9→86 = 求和 2.8× + 复利 3.1×)→ **回退:mateCost 正式口径 = v1 单跳 flat,递归引擎保留待评估**;峰值口径(并发持有)挂起(人类实时不可算);修复 acquireTop 自指种子 bug;测试 76 → 104 项全绿
-- [x] **③决策扫描梯 v1**(2026-11-23 第三会话):伴去向分类(ready / contained / external / unknown,配对负担不折进成本);②分析收敛(移除 clickConflicts 与 RevealUtility.direct,四份报告内化为 AnalysisResult 子属性,对外仅 `analyze()`);`Ladder.ts` 扫描梯瀑布(可插拔梯 + AgentOperation 三元组:动作 / 原因 / 预期);defaultLadder = slot-close → pair-complete → chain → wander;梯内择优 = 揭示预演 `simulateReveal`(效能 0.7 × Σ激活 + 0.3 × near,求和不归一);chain 梯两类(slot / pair,空槽 < 2 让位,pair 加分 0.3);测试四套 175 项全绿
+- [x] **分析数据深化**(2026-11-23 第二会话):揭露效能 v1.6 **独占面积数据**(ExclusiveCover pair 分布 + area/maxArea 标量,主观口径零成本);匹配消耗 v2.3 递归定价全程探索(四轮口径裁定 → acquireCostR/matchCostR 另档接线,v2.2 值不覆盖)后实测分化过剧(dig 均值 9→86 = 求和 2.8× + 复利 3.1×)→ **回退:mateCost 正式口径 = v1 单跳 flat,递归引擎保留待评估** ⛔ *2026-11-24 递归引擎与 mateCost 已随匹配消耗 v4 整体移除*;峰值口径(并发持有)挂起(人类实时不可算)*→ 同日由消除模拟的净占用峰值解决*;修复 acquireTop 自指种子 bug;测试 76 → 104 项全绿
+- [x] **③决策扫描梯 v1**(2026-11-23 第三会话):伴去向分类(ready / contained / external / unknown,配对负担不折进成本)⛔ *2026-11-24 随 MateCostReport 移除*;②分析收敛(移除 clickConflicts 与 RevealUtility.direct,四份报告内化为 AnalysisResult 子属性,对外仅 `analyze()`);`Ladder.ts` 扫描梯瀑布(可插拔梯 + AgentOperation 三元组:动作 / 原因 / 预期);defaultLadder = slot-close → pair-complete → chain → wander;梯内择优 = 揭示预演 `simulateReveal`(效能 0.7 × Σ激活 + 0.3 × near,求和不归一);chain 梯两类(slot / pair,空槽 < 2 让位,pair 加分 0.3);测试四套 175 项全绿
+- [x] **匹配消耗 v4 = 消除模拟的净占用峰值**(2026-11-24 第四会话):matchCost = 对挖掘区(闭包(launcher) ∪ 闭包(target))做一次消除模拟,记录**额外槽位占用的峰值**;单位 = 槽位格数,`executable` 即 `峰值 ≤ 空槽数`。模拟规则:空槽视为无限;每步四阶段(占位 → 统计占用【峰值在此】→ 匹配消除 → 重新统计);净占用扣除模拟开始时已有的槽内牌;闭包外找伴只找槽内的或当前可点的;剩余牌记入 `residual`。取代 v2.2 双口径平均与 v3 公式口径;递归定价引擎与 MateCostReport 一并移除。编辑器盘:峰值 3~9,11 个匹配仅 1 个可执行 → [map/nodes/level-generation.md](map/nodes/level-generation.md)
+- [x] **拾取差分 + 第一阶梯改造**(2026-11-24 第五会话):`slot-close` 候选来源改为 MatchReport 的 close 型匹配(行为边界不变);**拾取差分**——决策只产生「拾取一张牌」,故预演拾取 → 重新分析 → 比较差异;三个分量按字典序排序:**新增可执行匹配 > 类型升级 > 峰值下降总量**(进槽成本不计);预演只在当前感知集上进行,槽内状态变化纳入预演(按合并后的资源余量判定),在视图拷贝上做不污染原状态;`reason.delta` 随轨迹落盘。仅 slot-close 改完,pair-complete / chain 待续
 
 ## 已完成(P2)
 
@@ -33,10 +35,12 @@
 
 ## 待办(下一步)
 
-- [ ] **「需更多资源的 match」建模**(方案已提出,待设计者裁定):不改 matchCost,另开派生量 closurePairs(配对次数,计入闭包内部配对)与 holdNeed(持有需求 = 外联 + 未知),预算规则 holdNeed ≤ 空槽数 − 2;在此基础上实现 dig / cheap-hold / forced 三梯。待裁定:余量 2 是否合适、未知与外联是否同权、内部对是否细分
-- [ ] **⑤预期对账**:forecast × 实际感知 → 惊讶度入轨迹;hiddenRisk 计算(设计者另有计划,当前恒 0)
+- [ ] **ladder 逐梯改造**(第一阶梯已完成,按设计者指示逐个推进):`pair-complete` 与 `chain` 改用拾取差分择优(现仍用揭示预演得分 0.7 × Σ激活 + 0.3 × near);`wander` 是否也纳入差分待议
+- [ ] **基于 matchCost 实现需更多资源的 match 三梯**(dig / cheap-hold / forced):matchCost 已是槽位格数,可直接与空槽数比较(原 closurePairs / holdNeed 建模方案作废)
+- [ ] **⑤预期对账**:差分预演(只在当前感知集上)× 操作落定后的实际分析 = 预期误差,是惊讶度的天然来源(新露出的牌进入感知集带来的差异);hiddenRisk 计算(设计者另有计划,当前恒 0)
 - [ ] **决策深化**:hardness 的设计意图;chain 的 pair 加分上界(slot 链多揭 1 张 pairs 牌仍胜,未裁定);wander 由均匀随机改显著度加权;人格参数化(各权重 / 失误率 θ)
-- [ ] **分析侧尾巴**:递归档(acquireCostR)利用价值评估(启用需封顶/归一);识别阈值定档(两段式 τ色/τ印);AgentDebug 展示决策信息(效能分解 / chain 链路)
+- [ ] **分析侧尾巴**:识别阈值定档(两段式 τ色/τ印);AgentDebug 展示决策信息(效能分解 / chain 链路);编辑器内实跑验收选中面板的模拟分解显示(本轮仅类型检查)
+- [ ] **消除模拟的近似成分**(待观察):拿牌顺序为确定性贪心(能立即闭对者优先,其余 tileId 升序),峰值依赖该顺序;模拟结果对主观视图是下界(隐藏牌不计)。是否需要人格化的拿牌策略待需求出现再定
 - [ ] **难度感知信号**:槽压 / 犹豫度(utility − runnerUp 已随轨迹落盘)
 - [ ] **工程清理**:`Occlusion.ts` `unionArea` 的 `flatMap` 在工程编译目标下 12 条类型错误(历史遗留;与 `Array.includes` 同类,微信运行时兼容性待核)
 - [ ] **规划器(生成侧)**:逆向构造/前向生长设计(闭环几何未决)→ 与代理反馈闭环
@@ -58,7 +62,7 @@
 | 4 | 视觉载体演化:盲盒方案已搁置,现用真实麻将牌面;未来是否回归盲盒/玩具 IP 包装 | 🟡 实践决策,待产品层面复盘 |
 | 5 | 素材管线:AI 生成(工具/prompt 已备)+ 程序切半 | 🟡 用户推进中 |
 | 6 | 元素重复度参数化(每元素 2/4/6 张)与难度曲线目标形态 | 🟡 待关卡生成算法设计 |
-| 7 | 「需更多资源的 match」的资源口径(closurePairs / holdNeed 派生量与预算规则) | 🟡 方案待裁定 |
+| 7 | ~~「需更多资源的 match」的资源口径(closurePairs / holdNeed 派生量与预算规则)~~ | ✅ 已决(2026-11-24):matchCost = 消除模拟的净占用峰值,单位 = 槽位格数 |
 
 ## 阻塞
 

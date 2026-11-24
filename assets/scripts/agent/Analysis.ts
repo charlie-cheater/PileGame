@@ -11,7 +11,7 @@
 //     AnalysisResult.clickConflicts):验收对账在 tests 侧,运行期校验在 Runner 驱动侧
 //
 // 效用/槽压/犹豫度等评估算子属后续批次,输入亦为本文件的产物。
-// 2026-11-23:reveal/groups/mate/matches 全部内化为 analyze() 的产出
+// 2026-11-23:reveal/groups/matches 全部内化为 analyze() 的产出
 // (AnalysisResult 子属性),独立查询函数不再导出——②分析的对外入口收敛为 analyze。
 // ============================================================================
 
@@ -50,14 +50,12 @@ export interface AnalysisResult {
   reveal: RevealUtility;
   /** 同类归组报告(随分析产出) */
   groups: GroupReport;
-  /** 伴成本与伴去向报告(随分析产出) */
-  mate: MateCostReport;
   /** 匹配机会报告(随分析产出) */
   matches: MatchReport;
 }
 
 /** ②分析:主观视图 → 结构认知 + 全部派生报告(揭露效能 / 同类归组 /
- *  伴成本去向 / 匹配机会,2026-11-23 起全部内化为子属性)。
+ *  匹配机会,2026-11-23 起全部内化为子属性)。
  *  只接收主观视图,不接收任何真值(对账见 Runner / tests) */
 export function analyze(view: SubjectiveView): AnalysisResult {
   const tiles = view.perceived;
@@ -90,11 +88,10 @@ export function analyze(view: SubjectiveView): AnalysisResult {
   topo.allBlockers.forEach((list, id) => closureSize.set(id, list.length));
 
   // 组装:基础结构先行,派生报告依序产出(均消费 analysis 本体;
-  // groups/mate/matches 各自内部会再调 groupByIdentity,当前规模下重算可接受)
+  // groups/matches 各自内部会再调 groupByIdentity,当前规模下重算可接受)
   const analysis = { edges, blockersOf, occludesOf, depth, closureSize, derived } as AnalysisResult;
   analysis.reveal = revealUtility(view, edges);
   analysis.groups = groupByIdentity(view, analysis);
-  analysis.mate = mateCosts(view, analysis);
   analysis.matches = matchOpportunities(view, analysis);
   return analysis;
 }
@@ -200,16 +197,20 @@ function revealUtility(view: SubjectiveView, edges: ReadonlyArray<OcclusionEdge>
   return { count, max, exclusivePairs, area, maxArea };
 }
 
-// ─────────────────────────── v2.2 获取成本(单一事实源) ───────────────────────────
+// ─────────────────────────── 获取成本(v3 闭包口径,单一事实源) ───────────────────────────
 
 /**
- * v2.2 获取成本(flat):可点 1 / 被压 1 + (闭包 + 深度)/2 双口径平均。
- * 全文件三处内联式(定价引擎 falloff、伴成本计价、匹配消耗计价)与
- * Ladder 梯内效能打分的共同口径源;改动须经设计确认。
+ * 获取成本(v3,2026-11-23 设计裁定):可点 1 / 被压 1 + 闭包大小。
+ * 纯闭包口径——不再混入最长链深度(深度只回答轮次,不回答资源);
+ * 闭包同时涵盖扇入宽度与链深。
+ *
+ * 用途:仅为**排序估计**——决定每元素的配对候选序(launcher = 成本最低者)。
+ * 它不是消耗:配对的真实消耗以 MatchOpportunity.matchCost(消除模拟的
+ * 净占用峰值)为准,两者不必有大小关系。
  */
 export function flatCostOf(tileId: number, analysis: AnalysisResult): number {
   if (analysis.derived.get(tileId)?.clickable === true) return 1;
-  return 1 + ((analysis.closureSize.get(tileId) ?? 0) + (analysis.depth.depth.get(tileId) ?? 0)) / 2;
+  return 1 + (analysis.closureSize.get(tileId) ?? 0);
 }
 
 // ─────────────────────────── 分析扩展:同类归组 ───────────────────────────
@@ -277,230 +278,12 @@ function groupByIdentity(view: SubjectiveView, analysis: AnalysisResult): GroupR
 }
 
 
+
 // ─────────────────────────── 分析扩展:匹配消耗(启动牌 × 目标牌) ───────────────────────────
 
-/** 配对候选牌(槽内或已识别 pile 牌)的获取成本刻画 */
-export interface MatchTileRef {
-  tileId: number;
-  /** 获取成本(空槽单位):槽内 = 0;pile = 1 + (revealDepth + revealCount) / 2。
-   *  2026-11-23 v2.2:双口径平均——闭包口径偏保守(全揭露的下界加和)、
-   *  深度口径偏乐观(仅最长链),取均对冲;两原始值并留对照 */
-  acquireCost: number;
-  /** v2.3 递归获取成本(buildPricingEngine.acquireTop:仅闭包口径、
-   *  递归深度 ≤3、回环切断回落 v2.2)。**另档留档,不覆盖 acquireCost**,
-   *  两档对照供③决策消费(2026-11-23 用户指示);槽内 = 0 */
-  acquireCostR: number;
-  /** 揭露消耗·闭包口径 = 遮挡传递闭包大小(全部揭露需先移除的牌数;
-   *  涵盖扇入宽度与链深) */
-  revealCount: number;
-  /** 揭露消耗·深度口径 = 最长遮挡链深度(轮次语义;v1 原口径,保留对照) */
-  revealDepth: number;
-  /** 是否已在槽中(成本 0 的启动牌) */
-  inSlot: boolean;
-}
-
-/** 匹配类型(描述性分类,由两张牌的成本形态导出) */
-export type MatchType = 'close' | 'double' | 'hold' | 'dig';
-
-export interface MatchOpportunity {
-  elementId: string;
-  /** 启动牌:配对两张中获取成本最低者(槽内牌成本 0,存在即恒为启动牌) */
-  launcher: MatchTileRef;
-  /** 目标牌:另一张(次低成本) */
-  target: MatchTileRef;
-  /** 匹配总消耗 = 启动牌 + 目标牌获取成本(空槽单位)。无论当前资源是否足够均计算 */
-  matchCost: number;
-  /** v2.3:launcher.acquireCostR + target.acquireCostR(另档,不覆盖 matchCost;
-   *  列表排序仍按 v2.2 matchCost——行为不变,消费切换属③决策) */
-  matchCostR: number;
-  type: MatchType;
-  /** 当前空槽能否立即启动(规则判定,见实现;资源不足仅冻结执行,不影响 matchCost) */
-  executable: boolean;
-}
-
-export interface MatchReport {
-  /** 按匹配消耗升序(同成本按 elementId) */
-  opportunities: MatchOpportunity[];
-  /** 当前空槽数 */
-  emptySlots: number;
-  /** 各类型机会计数 */
-  byType: { close: number; double: number; hold: number; dig: number };
-}
-
-/**
- * 匹配消耗枚举(2026-11-23 v2,设计者口径;同日 v2.1 挖掘计量升级):
- *   · 每元素取获取成本最低的两张已识别候选牌(含槽内)组成最优配对
- *   · 启动牌 = 成本最低那张;槽内牌 = 成本 0 的启动牌
- *   · matchCost = 两张获取成本之和——即便当前空槽不允许执行也计算
- *     (如双埋型:成本 = 揭露两张牌的全部资源消耗估计)
- *   · 获取成本:槽内 0 / 可点 1 / 被压 1 + (闭包口径 + 深度口径) / 2
- *     (v2.2 双口径平均——闭包偏保守、深度偏乐观;两原始值并留对照)
- *
- * 迭代方向:遮挡者自身配对成本的递归(**已实现为另档 acquireCostR/matchCostR,
- * 2026-11-23;v2.2 值保留对照**);并发持有的峰值口径(现为加和估计)后续再议。
- * 下界语义:未识别/隐藏的更便宜伴不在候选内,列表与成本均为真实最优的下界。
- *
- * 2026-11-23 起内化为 analyze 的产出步骤(随 AnalysisResult.matches 返回),
- * 不再单独导出。
- */
-function matchOpportunities(view: SubjectiveView, analysis: AnalysisResult): MatchReport {
-  const groups = groupByIdentity(view, analysis);
-  const engine = buildPricingEngine(view, analysis);   // v2.3 另档定价(acquireCostR)
-  const emptySlots = SLOT_COUNT - view.slot.length;
-  const closureOf = (id: number): number => analysis.closureSize.get(id) ?? 0;
-  const depthOf = (id: number): number => analysis.depth.depth.get(id) ?? 0;
-  const clickableOf = (id: number): boolean =>
-    analysis.derived.get(id)?.clickable === true;
-
-  const opportunities: MatchOpportunity[] = [];
-
-  groups.groups.forEach(g => {
-    // 候选:槽内(至多 1 张,成本 0)+ 已识别 pile 牌(成本 1 + 双口径均值)
-    const candidates: MatchTileRef[] = [];
-    if (g.slot.length > 0) {
-      candidates.push({ tileId: g.slot[0], acquireCost: 0, acquireCostR: 0,
-                        revealCount: 0, revealDepth: 0, inSlot: true });
-    }
-    for (const r of g.pile) {
-      const blocked = !clickableOf(r.tileId);
-      const cnt = blocked ? closureOf(r.tileId) : 0;
-      const dep = blocked ? depthOf(r.tileId) : 0;
-      candidates.push({
-        tileId: r.tileId,
-        acquireCost: flatCostOf(r.tileId, analysis),
-        acquireCostR: engine.acquireTop(r.tileId),
-        revealCount: cnt,
-        revealDepth: dep,
-        inSlot: false,
-      });
-    }
-    if (candidates.length < 2) return;   // 伴不可见/单张:当前信息下不成对
-
-    candidates.sort((a, b) => a.acquireCost - b.acquireCost || a.tileId - b.tileId);
-    const launcher = candidates[0];
-    const target = candidates[1];
-    const matchCost = launcher.acquireCost + target.acquireCost;
-    const matchCostR = launcher.acquireCostR + target.acquireCostR;
-
-    const type: MatchType =
-      launcher.inSlot && target.revealCount === 0 ? 'close'
-      : !launcher.inSlot && launcher.revealCount === 0 && target.revealCount === 0 ? 'double'
-      : launcher.revealCount > 0 ? 'dig'
-      : 'hold';
-
-    // 启动合法性(v1 规则口径):非闭对拾取入槽后须 ≤3 → 需 2 空槽;
-    // 闭对 1;启动牌已在槽(持有中):目标可点 1、目标被压按下界 2
-    const executable = launcher.inSlot
-      ? (target.revealCount === 0 ? emptySlots >= 1 : emptySlots >= 2)
-      : emptySlots >= 2;
-
-    opportunities.push({ elementId: g.elementId, launcher, target, matchCost, matchCostR, type, executable });
-  });
-
-  opportunities.sort((a, b) =>
-    a.matchCost - b.matchCost || (a.elementId < b.elementId ? -1 : 1));
-
-  const byType = { close: 0, double: 0, hold: 0, dig: 0 };
-  opportunities.forEach(o => { byType[o.type]++; });
-
-  return { opportunities, emptySlots, byType };
-}
-
-// ─────────────────────────── 分析扩展:伴成本(v2.3 配对负担加权 · 分步第一步) ───────────────────────────
-
-/** 递归拓扑事件:一次定价(v2.3 引擎)的记录(2026-11-23 用户指示:
- *  留作③决策阶段素材——依赖树可经 parent/blocker 重建,falloff 命中
- *  可作估计置信信号) */
-export interface MatePriceEvent {
-  /** 被定价的牌 */
-  tileId: number;
-  /** 递归层(顶层选伴 = 1;锚点 = 0) */
-  depth: number;
-  /** 定价结果(falloff 时为 v2.2 值) */
-  value: number;
-  /** 结局:normal 正常定价 / cycle 回环切断 / depth 深度截断 */
-  outcome: 'normal' | 'cycle' | 'depth';
-  /** 下钻通道:root 顶层选伴 / closure 闭包口径 unit(depthW 裁减后仅此两条) */
-  channel: 'root' | 'closure';
-  /** 定价父牌(承其估价帧下钻;锚点 = null) */
-  parent: number | null;
-  /** 经由的遮挡者(channel = closure 时:其配对需要本牌;root = null) */
-  blocker: number | null;
-}
-
-/** 伴去向:闭包内某个遮挡者的伴,相对「本闭包」在哪(2026-11-23 重新建模——
- *  配对负担不折叠进成本,改为有界的结构分类;判据见 ClosureMateRecord) */
-export type MateDisposition = 'ready' | 'contained' | 'external' | 'unknown';
-
-/** 一条(被挖牌, 闭包成员)的伴去向记录 */
-export interface ClosureMateRecord {
-  /** 被挖牌(闭包的参照系;挖它须先移除 blocker) */
-  target: number;
-  /** 闭包成员(遮挡者) */
-  blocker: number;
-  /** 伴去向(优先级 ready > contained;unknown 与其余三类互斥):
-   *  ready     伴在槽内或可点——顺手清掉,瞬态占槽即闭合
-   *  contained 伴也埋在本闭包内(含伴即 target 本身)——配对在挖掘区内
-   *            闭合,不开新战线(闭包内的双亮对属 ready)
-   *  external  伴埋在闭包外——移除即分叉出第二战场(兔穴链)
-   *  unknown   无已知伴('?' 或无候选)——不确定性(对接⑤预期) */
-  disposition: MateDisposition;
-  /** 选中的伴(= mateOf(blocker);unknown 为 null) */
-  mateId: number | null;
-  /** 伴的 v2.2 flat(= cost(blocker)):槽内 0 / 可点 1 / external 时即分叉战场深度 */
-  mateFlat: number;
-}
-
-/** 四类计数(全部感知 pile 牌入表;闭包为空则全 0) */
-export interface DispositionCount {
-  ready: number;
-  contained: number;
-  external: number;
-  unknown: number;
-}
-
-/** 伴成本报告:「以配对移除一张牌」时另一半的获取成本 + 伴去向分类
- *  (主观口径,单跳 flat 定价) */
-export interface MateCostReport {
-  /** tileId → 伴成本:
-   *  0 = 最廉已知伴在槽内(配对半价已预付);
-   *  flat(c) = 已识别 pile 伴中最廉者的 v2.2 获取成本;
-   *  ambient = 无已知伴(元素未识别 '?' 或伴不在感知集)时的环境物价回落 */
-  cost: Map<number, number>;
-  /** tileId → 选中的伴 tileId(null = 无已知伴,走环境物价;并列取 tileId 小者) */
-  mateOf: Map<number, number | null>;
-  /** 环境物价 F:感知集内已识别 pile 牌的 flat(v2.2)均值(空集 = 1) */
-  ambient: number;
-  /** 闭包内遮挡者的伴去向记录:每 (target, blocker) 一条(闭包为空的 target 无记录);
-   *  target 序 = perceived,blocker 升序(确定性) */
-  closureMates: ClosureMateRecord[];
-  /** target → 四类计数(之和 = analysis.closureSize)——有界聚合;
-   *  外联率等比值由消费端按需派生,不在此预设 */
-  dispositionCount: Map<number, DispositionCount>;
-}
-
-/**
- * 定价引擎工厂(模块内部;matchOpportunities 经 acquireCostR 另档消费)。
- *
- * **保留待评估(2026-11-23 用户裁定)**:递归定价分化过剧(闭包求和 +
- * 递归复利 + 重叠闭包重复计费,dig 均值 9 → 86)、不符人类直觉——
- * 不作为正式 mateCost 口径(已回退 v1 单跳);引擎存续于 acquireCostR
- * 另档,后续若找到利用价值再启用。
- *
- * 引擎口径(v2.3 原样保留):
- *   · acquireR(t) = 可点 1;被压 1 + closureW(仅闭包口径)
- *     closureW = Σ 闭包成员 unit(b);unit(b) = (1 + mateCost(b))/2
- *   · mateCost(b) = 槽内伴 0 / pile 已识别候选 acquireR(c, d+1) 最廉 / 无已知伴 → ambient
- *   · 递归深度硬上限 3(嵌套 acquireR 层数);抵达 → v2.2 flat falloff
- *   · 回环检测:估价栈上已在算的牌再现 → v2.2 flat;获取查询起点即被定价牌,
- *     acquireR 内部 stack.add 已覆盖重入(勿预置种子,否则首查恒 flat)
- *   · 事件流(traces):acquireTop 每次查询独立成流(完成序,子先于父,
- *     末条 = 起点根事件;暂由引擎内部持有,外显接口待需要时再加)
- *   · 主观口径与无记忆化等约定同前
- */
 /** 闭包成员索引工厂(记忆化 DFS over blockersOf,与 OcclusionTopology.allBlockers
- *  同源即 closureSize 的成员版;tileId 升序确定性输出)。
- *  定价引擎与伴去向分类共用。 */
+ *  同源即 closureSize 的成员版;tileId 升序确定性输出)。匹配消耗的挖掘区
+ *  与消除模拟的挖牌候选共用。 */
 function makeClosureIndex(analysis: AnalysisResult): (id: number) => number[] {
   const memo = new Map<number, number[]>();
   return (id: number): number[] => {
@@ -519,209 +302,304 @@ function makeClosureIndex(analysis: AnalysisResult): (id: number) => number[] {
   };
 }
 
-interface PricingEngine {
-  /** v2.3 递归获取成本(另档留档,不覆盖任何正式口径) */
-  acquireTop(id: number): number;
-  /** acquireTop 查询事件流(键 = 查询起点) */
-  readonly traces: Map<number, MatePriceEvent[]>;
+/** 配对候选牌(槽内或已识别 pile 牌) */
+export interface MatchTileRef {
+  tileId: number;
+  /** 单张获取成本(闭包口径 = flatCostOf):槽内 0 / 可点 1 / 被压 1 + 闭包大小。
+   *  仅用于配对候选排序(launcher = 成本最低者);不是消耗——
+   *  真实消耗见 MatchOpportunity.matchCost(消除模拟的净占用峰值) */
+  acquireCost: number;
+  /** 闭包大小(遮挡传递闭包 = 全部揭露需先移除的牌数;可点/槽内 = 0) */
+  revealCount: number;
+  /** 是否已在槽中(成本 0 的启动牌) */
+  inSlot: boolean;
 }
 
-function buildPricingEngine(view: SubjectiveView, analysis: AnalysisResult): PricingEngine {
-  /** 递归深度硬上限(嵌套 acquireR 层数;抵达回落 v2.2 flat) */
-  const RECUR_LIMIT = 3;
+/** 匹配类型(描述性分类,由两张牌的成本形态导出) */
+export type MatchType = 'close' | 'double' | 'hold' | 'dig';
 
-  // flat:v2.2 获取成本(单一事实源 flatCostOf)——深断/环切的统一 falloff,
-  // 亦是 ambient 的基础
-  const flatOf = (id: number): number => flatCostOf(id, analysis);
+/** 匹配消耗的分解数据(消除模拟的记账结果;matchCost = peak) */
+export interface MatchCostBreakdown {
+  /** 挖掘区 = 闭包(launcher) ∪ 闭包(target) 的成员(tileId 升序)。
+   *  并集口径:两牌共享的前置(遮挡拓扑上的共同路径)只计一次 */
+  region: number[];
+  /** 模拟开始时槽内已有的牌(既成事实,不计入净占用;被用于配对时净占用随之 −1) */
+  preexisting: number[];
+  /** 逐步净占用序列(每次拿牌后的阶段 2 读数;峰值 = 其最大值)。
+   *  首元素对应 launcher 入槽(若 launcher 已在槽内则不入槽,序列从挖 target 起) */
+  occupancy: number[];
+  /** 模拟结束时槽内剩余的牌(出不去:伴被压或身份未知) */
+  residual: number[];
+  /** 模拟的拿牌次数 */
+  steps: number;
+}
 
-  const groups = groupByIdentity(view, analysis);
-  const byId = new Map(view.perceived.map(t => [t.tileId, t]));
+export interface MatchOpportunity {
+  elementId: string;
+  /** 启动牌:配对两张中获取成本最低者(槽内牌成本 0,存在即恒为启动牌) */
+  launcher: MatchTileRef;
+  /** 目标牌:另一张(次低成本) */
+  target: MatchTileRef;
+  /** 匹配消耗 = 消除模拟的**净占用峰值**:完成这次配对,最多同时占几个新槽位。
+   *  单位 = 槽位格数,可与空槽数直接比较(peak ≤ 空槽数 ⇔ 执行得下去)。
+   *  空槽视为无限(模拟不因槽满中断);无论当前资源是否足够均计算 */
+  matchCost: number;
+  /** 消耗分解(挖掘区 / 原有槽内牌 / 占用序列 / 剩余) */
+  cost: MatchCostBreakdown;
+  type: MatchType;
+  /** 当前空槽数是否不小于 matchCost(由模拟结果与资源直接比较得出) */
+  executable: boolean;
+}
 
-  // 环境物价:已识别 pile 牌的 flat 均值(空集 = 1;槽内/未识别不计入)
-  let ambient = 1;
-  {
-    const flats: number[] = [];
-    groups.groups.forEach(g => g.pile.forEach(r => flats.push(flatOf(r.tileId))));
-    if (flats.length > 0) ambient = flats.reduce((s, x) => s + x, 0) / flats.length;
-  }
-
-  // 每元素候选:槽内伴(至多记首张)+ 已识别 pile 候选(定价递归时算)
-  const pileCandOf = new Map<string, number[]>();
-  const slotMateOf = new Map<string, number>();
-  groups.groups.forEach(g => {
-    pileCandOf.set(g.elementId, g.pile.map(r => r.tileId));
-    if (g.slot.length > 0) slotMateOf.set(g.elementId, g.slot[0]);
-  });
-
-  // 闭包成员表(与伴去向分类共用索引工厂 makeClosureIndex)
-  const closureOf = makeClosureIndex(analysis);
-
-  // 递归拓扑(事件在定价完成点记录;完成序,子先于父)
-  const traces = new Map<number, MatePriceEvent[]>();
-  let trace: MatePriceEvent[] | null = null;
-
-  const acquireR = (id: number, depth: number, stack: Set<number>,
-                    parent: number, channel: MatePriceEvent['channel'],
-                    blocker: number | null): number => {
-    const emit = (value: number, outcome: MatePriceEvent['outcome']): void => {
-      if (trace) trace.push({ tileId: id, depth, value, outcome, channel, parent, blocker });
-    };
-    if (depth >= RECUR_LIMIT) {                       // 深断 → v2.2 flat falloff
-      const v = flatOf(id);
-      emit(v, 'depth');
-      return v;
-    }
-    if (stack.has(id)) {                              // 回环切断 → v2.2 falloff
-      const v = flatOf(id);
-      emit(v, 'cycle');
-      return v;
-    }
-    if (analysis.derived.get(id)?.clickable === true) {
-      emit(1, 'normal');
-      return 1;
-    }
-
-    stack.add(id);
-    let closureW = 0;
-    for (const b of closureOf(id)) {
-      closureW += (1 + matePick(b, depth, stack, id, 'closure', b).cost) / 2;
-    }
-    stack.delete(id);
-    const v = 1 + closureW;   // 仅闭包口径(2026-11-23 用户裁定:depthW 裁减)
-    emit(v, 'normal');
-    return v;
-  };
-
-  /** 选伴:槽内 0 / pile 候选递归定价最廉 / 无已知伴走环境物价 */
-  const matePick = (b: number, depth: number, stack: Set<number>,
-                    parent: number, channel: MatePriceEvent['channel'],
-                    blocker: number | null):
-      { cost: number; id: number | null } => {
-    const el = byId.get(b)?.elementId;
-    if (el !== undefined && el !== UNKNOWN_ELEMENT && slotMateOf.has(el)) {
-      return { cost: 0, id: slotMateOf.get(el)! };
-    }
-    const list = el === undefined || el === UNKNOWN_ELEMENT ? undefined : pileCandOf.get(el);
-    let best: { cost: number; id: number } | null = null;
-    if (list) {
-      for (const c of list) {
-        if (c === b) continue;                        // 剔除自身
-        const v = acquireR(c, depth + 1, stack, parent, channel, blocker);  // mate 边:+1 层
-        if (!best || v < best.cost || (v === best.cost && c < best.id)) {
-          best = { cost: v, id: c };
-        }
-      }
-    }
-    return best ?? { cost: ambient, id: null };
-  };
-
-  return {
-    traces,
-    acquireTop(id: number): number {
-      trace = [];
-      // 起点即被定价牌:内部 stack.add 覆盖重入,勿预置种子(否则恒 flat);
-      // 末条根事件(tileId=id, channel='root', parent=null)即本查询结果
-      const v = acquireR(id, 0, new Set(), null, 'root', null);
-      traces.set(id, trace);
-      return v;
-    },
-  };
+export interface MatchReport {
+  /** 按匹配消耗升序(同成本按 elementId) */
+  opportunities: MatchOpportunity[];
+  /** 当前空槽数 */
+  emptySlots: number;
+  /** 各类型机会计数 */
+  byType: { close: number; double: number; hold: number; dig: number };
 }
 
 /**
- * 伴成本枚举(v1 单跳口径,2026-11-23 用户裁定回退为正式口径):
- * 「以配对移除一张牌」时另一半的获取成本 = 已知候选的 **v2.2 flat** 最廉值,
- * 不经递归(递归版经实测分化过剧,不符人类直觉;引擎保留于
- * buildPricingEngine 供 acquireCostR 另档消费)。
+ * 匹配消耗(v4,2026-11-24 设计裁定——消除模拟的净占用峰值):
+ *   · 每元素取获取成本最低的两张已识别候选牌(含槽内)组成最优配对
+ *   · 启动牌 = 成本最低那张;槽内牌 = 成本 0 的启动牌
+ *   · matchCost = 对挖掘区做一次消除模拟,记录**额外槽位占用的峰值**
  *
- * 口径(全部主观,不查真实 elementId、不看隐藏牌):
- *   · 候选集 = 同元素已识别 pile 牌 + 槽内同元素牌(groupByIdentity 单一
- *     事实源);'?' 牌无候选,走回落;最廉即可,并列取 tileId 小者
- *   · 伴成本:槽内 0 / pile flat(c) 最廉 / 无已知伴 → ambient
- *   · 回落 F(环境物价)= 已识别 pile 牌的 flat 均值——主观可算的
- *     「本盘牌普遍埋多深」,自适应盘面难度;无已识别牌时 = 1
- *   · 伴去向分类(配对数据的扩展):对每个有闭包的 target,其闭包成员 b 按伴的
- *     位置归类——伴在槽内/可点 = ready;否则伴 ∈ closure(target) ∪ {target}
- *     = contained(配对在挖掘区内闭合);否则 external(分叉出闭包外战场);
- *     无已知伴 = unknown。只记录不折价:成本口径(v2.2)不受影响
+ * 模拟规则:
+ *   · 空槽视为无限:不因槽满中断,挖掘区内可合并的配对最终一定合并
+ *   · 每步四阶段:① 牌入槽占位 → ② 统计占用(**峰值在此读取**)→
+ *     ③ 检查匹配并消除 → ④ 重新统计占用。峰值取消除之前——牌刚进槽、
+ *     尚未配对时占用最高,这才是真实需要的空槽数
+ *   · 净占用 = 槽内总数 − 模拟开始时已有的槽内牌数。原有牌被用于配对时
+ *     总数减 1,净占用随之下降(「−1 处理」由此自然得出:闭包仅 1 张、
+ *     槽内已持伴时,额外占用 = 1)
+ *   · 挖牌:对 launcher、target 依次执行「反复拿它当前可点的闭包成员,直到它可点,
+ *     再拿它」。候选只取该牌自己的闭包——不顺手拿别的东西;优先拿能立即闭对的。
+ *     launcher 已在槽内则跳过。两牌共享的前置只被拿一次
+ *   · 清槽:对槽内出不去的牌,**只在槽内牌与当前可点牌中**找伴——不找被
+ *     遮盖的(递归深度超出一般人类的感知范围)。伴被压或身份未知的牌
+ *     留在 residual,不计入峰值
  *
- * 2026-11-23 起内化为 analyze 的产出步骤(随 AnalysisResult.mate 返回),
- * 不再单独导出。
+ * 取代的历史口径(均为对峰值的公式近似):v2.2 双口径平均、v3 闭包并集 −
+ *   可合并项 + 待入槽张数、+1/+2 加项规则。共同路径只计一次(并集)、
+ *   可合并项的消化、+1 还是 +2,现在是模拟的自然结果而非显式规则。
+ *
+ * 候选规则的推论(穷举 57699 组几何核实):挖掘区内若有 1 张同元素牌压着某候选,
+ *   它必不比被压者贵,会被选为 target——「中间那张被选为 target」是规则的正确行为。
+ *
+ * 主观口径:全部基于感知视图;未识别/隐藏的牌不在候选与闭包内,峰值为真实值的下界。
+ * 2026-11-23 起内化为 analyze 的产出步骤(随 AnalysisResult.matches 返回)。
  */
-function mateCosts(view: SubjectiveView, analysis: AnalysisResult): MateCostReport {
-  // flat:v2.2 获取成本(单一事实源 flatCostOf)
-  const flatOf = (id: number): number => flatCostOf(id, analysis);
-
+function matchOpportunities(view: SubjectiveView, analysis: AnalysisResult): MatchReport {
   const groups = groupByIdentity(view, analysis);
+  const emptySlots = SLOT_COUNT - view.slot.length;
+  const closureOf = makeClosureIndex(analysis);
 
-  // 环境物价:已识别 pile 牌的 flat 均值(空集 = 1;槽内/未识别不计入)
-  let ambient = 1;
-  {
-    const flats: number[] = [];
-    groups.groups.forEach(g => g.pile.forEach(r => flats.push(flatOf(r.tileId))));
-    if (flats.length > 0) ambient = flats.reduce((s, x) => s + x, 0) / flats.length;
-  }
+  const opportunities: MatchOpportunity[] = [];
 
-  // 每元素候选价目:槽内 0 + 已识别 pile 各自 flat
-  const priceOf = new Map<string, Array<{ tileId: number; cost: number }>>();
   groups.groups.forEach(g => {
-    const list: Array<{ tileId: number; cost: number }> = [];
-    g.slot.forEach(id => list.push({ tileId: id, cost: 0 }));
-    g.pile.forEach(r => list.push({ tileId: r.tileId, cost: flatOf(r.tileId) }));
-    priceOf.set(g.elementId, list);
+    // 候选:槽内(至多 1 张,成本 0)+ 已识别 pile 牌(成本 = flatCostOf)
+    const candidates: MatchTileRef[] = [];
+    if (g.slot.length > 0) {
+      candidates.push({ tileId: g.slot[0], acquireCost: 0, revealCount: 0, inSlot: true });
+    }
+    for (const r of g.pile) {
+      candidates.push({
+        tileId: r.tileId,
+        acquireCost: flatCostOf(r.tileId, analysis),
+        revealCount: analysis.closureSize.get(r.tileId) ?? 0,
+        inSlot: false,
+      });
+    }
+    if (candidates.length < 2) return;   // 伴不可见/单张:当前信息下不成对
+
+    candidates.sort((a, b) => a.acquireCost - b.acquireCost || a.tileId - b.tileId);
+    const launcher = candidates[0];
+    const target = candidates[1];
+
+    // 挖掘区:两牌闭包并集(共同路径只计一次;tileId 升序)
+    const regionSet = new Set<number>();
+    for (const id of closureOf(launcher.tileId)) regionSet.add(id);
+    for (const id of closureOf(target.tileId)) regionSet.add(id);
+    const region = [...regionSet].sort((a, b) => a - b);
+
+    const sim = simulateMatch(view, launcher.tileId, target.tileId, region, closureOf);
+
+    const type: MatchType =
+      launcher.inSlot && target.revealCount === 0 ? 'close'
+      : !launcher.inSlot && launcher.revealCount === 0 && target.revealCount === 0 ? 'double'
+      : launcher.revealCount > 0 ? 'dig'
+      : 'hold';
+
+    opportunities.push({
+      elementId: g.elementId, launcher, target,
+      matchCost: sim.peak,
+      cost: {
+        region,
+        preexisting: sim.preexisting,
+        occupancy: sim.occupancy,
+        residual: sim.residual,
+        steps: sim.steps,
+      },
+      type,
+      executable: emptySlots >= sim.peak,
+    });
   });
 
-  const cost = new Map<number, number>();
-  const mateOf = new Map<number, number | null>();
-  for (const t of view.perceived) {
-    const list = t.elementId === UNKNOWN_ELEMENT ? undefined : priceOf.get(t.elementId);
-    let best: { tileId: number; cost: number } | null = null;
-    if (list) {
-      for (const c of list) {
-        if (c.tileId === t.tileId) continue;          // 剔除自身
-        if (!best || c.cost < best.cost
-            || (c.cost === best.cost && c.tileId < best.tileId)) {
-          best = c;
+  opportunities.sort((a, b) =>
+    a.matchCost - b.matchCost || (a.elementId < b.elementId ? -1 : 1));
+
+  const byType = { close: 0, double: 0, hold: 0, dig: 0 };
+  opportunities.forEach(o => { byType[o.type]++; });
+
+  return { opportunities, emptySlots, byType };
+}
+
+// ─────────────────────────── 消除模拟(匹配消耗的前向模型,主观) ───────────────────────────
+
+interface MatchSimulation {
+  /** 净占用峰值(= matchCost) */
+  peak: number;
+  /** 模拟开始时槽内已有的牌 */
+  preexisting: number[];
+  /** 逐步净占用序列(阶段 2 读数) */
+  occupancy: number[];
+  /** 结束时槽内剩余的牌 */
+  residual: number[];
+  /** 拿牌次数 */
+  steps: number;
+}
+
+/**
+ * 消除模拟:在主观视图上把 launcher 与 target 配掉,记账净占用峰值。
+ *
+ * 状态:removed = 已拿走的牌。可点性在「感知集 − removed」上重算
+ * (computeOcclusion,与 simulateReveal 同一机制)——挖开一张,下面的牌才可点。
+ * 槽内牌的身份:模拟开始时已有的取自 view.slot;模拟中拿进来的取自主观视图
+ * (未识别牌以 UNKNOWN_ELEMENT 入槽,永不配对 → residual)。
+ *
+ * 拿牌优先级(确定性;模拟「一个不犯傻的玩家」):
+ *   1. 挖某张牌时:其闭包内能立即闭对的成员优先,其余按 tileId 升序
+ *   2. 清槽阶段:按入槽序检查槽内牌,为其找可点伴
+ *
+ * 逐步记账见 MatchCostBreakdown.occupancy。
+ */
+function simulateMatch(
+  view: SubjectiveView,
+  launcherId: number,
+  targetId: number,
+  region: ReadonlyArray<number>,
+  closureOf: (id: number) => number[],
+): MatchSimulation {
+  const elemOf = new Map<number, string>();
+  for (const t of view.perceived) elemOf.set(t.tileId, t.elementId);
+  for (const s of view.slot) elemOf.set(s.tileId, s.elementId);
+
+  const removed = new Set<number>();
+  /** 模拟槽:tileId 列表(保持入槽序;消除时移除) */
+  const slot: number[] = [];
+  /** 模拟开始时槽内已有的牌(净占用的基数) */
+  const preexisting: number[] = [];
+  for (const s of view.slot) { slot.push(s.tileId); preexisting.push(s.tileId); }
+  const base = slot.length;
+
+  const occupancy: number[] = [];
+  const residual: number[] = [];
+  let peak = 0;
+  let steps = 0;
+
+  /** 当前主观可点牌(感知集 − removed 上重算) */
+  const clickableNow = (): number[] => {
+    const hypo = view.perceived.filter(t => !removed.has(t.tileId));
+    const derived = computeOcclusion(hypo);
+    const ids: number[] = [];
+    for (const t of hypo) {
+      if (derived.get(t.tileId)?.clickable === true) ids.push(t.tileId);
+    }
+    return ids.sort((a, b) => a - b);
+  };
+
+  /** 阶段 ③:槽内同元素配对全部消除(直到无对可消) */
+  const settle = (): void => {
+    let paired = true;
+    while (paired) {
+      paired = false;
+      outer: for (let i = 0; i < slot.length; i++) {
+        const e = elemOf.get(slot[i]);
+        if (e === undefined || e === UNKNOWN_ELEMENT) continue;
+        for (let j = i + 1; j < slot.length; j++) {
+          if (elemOf.get(slot[j]) === e) {
+            slot.splice(j, 1);
+            slot.splice(i, 1);
+            paired = true;
+            break outer;
+          }
         }
       }
     }
-    if (best) {
-      cost.set(t.tileId, best.cost);
-      mateOf.set(t.tileId, best.tileId);
-    } else {
-      cost.set(t.tileId, ambient);             // 无已知伴 / 未识别 → 环境物价
-      mateOf.set(t.tileId, null);
-    }
-  }
-
-  // ── 伴去向分类(闭包相对;只记录不折价)──
-  const closureOf = makeClosureIndex(analysis);
-  const slotIds = new Set(view.slot.map(s => s.tileId));
-  const dispositionOf = (mateId: number | null, region: ReadonlySet<number>): MateDisposition => {
-    if (mateId === null) return 'unknown';
-    if (slotIds.has(mateId) || analysis.derived.get(mateId)?.clickable === true) return 'ready';
-    return region.has(mateId) ? 'contained' : 'external';
   };
 
-  const closureMates: ClosureMateRecord[] = [];
-  const dispositionCount = new Map<number, DispositionCount>();
-  for (const t of view.perceived) {
-    const counts: DispositionCount = { ready: 0, contained: 0, external: 0, unknown: 0 };
-    const members = closureOf(t.tileId);
-    if (members.length > 0) {
-      const region = new Set<number>(members);
-      region.add(t.tileId);                    // 伴即 target 本身亦属挖掘区内闭合
-      for (const b of members) {
-        const mateId = mateOf.get(b) ?? null;
-        const disposition = dispositionOf(mateId, region);
-        counts[disposition]++;
-        closureMates.push({ target: t.tileId, blocker: b, disposition, mateId, mateFlat: cost.get(b)! });
-      }
+  /** 仍在堆上的感知牌(未拿走、不在槽内) */
+  const onPile = (id: number): boolean =>
+    !removed.has(id) && !slot.some(x => x === id);
+
+  /** 拿一张牌:阶段 ①②③④(只对仍在堆上的牌生效) */
+  const take = (id: number): void => {
+    if (!onPile(id)) return;
+    removed.add(id);
+    slot.push(id);                            // ① 入槽占位
+    const net = slot.length - base;           // ② 统计占用 —— 峰值在此读取
+    occupancy.push(net);
+    if (net > peak) peak = net;
+    settle();                                 // ③ 检查匹配并消除
+    steps++;                                  // ④(占用由下次 ② 重读)
+  };
+
+  // ── 主循环:配掉 launcher 与 target ──
+  // 挖开 goal:反复拿其当前可点的闭包成员,直到 goal 可点,再拿 goal。
+  // 候选只取 goal 自己的闭包——不顺手拿别的东西。两牌共享的前置(共同路径)
+  // 在挖第二张时已不在堆上,自然只计一次。
+  const regionSet = new Set<number>(region);
+  const digAndTake = (goal: number): void => {
+    const own = new Set<number>(closureOf(goal));
+    let guard = 0;
+    while (!removed.has(goal) && guard++ < view.perceived.length + 4) {
+      const click = clickableNow();
+      if (click.some(id => id === goal)) { take(goal); return; }
+      // 候选:可点 ∧ 属于 goal 的闭包 ∧ 属于挖掘区 ∧ 仍在堆上
+      const cands = click.filter(id => own.has(id) && regionSet.has(id) && onPile(id));
+      if (cands.length === 0) break;            // 闭包挖空仍不可点(隐藏牌所致):中止
+      // 优先拿能立即闭对的;同级 tileId 升序
+      const slotElems = new Set(slot.map(id => elemOf.get(id)));
+      const closing = cands.filter(id => slotElems.has(elemOf.get(id)));
+      take((closing.length > 0 ? closing : cands)[0]);
     }
-    dispositionCount.set(t.tileId, counts);
+  };
+
+  // launcher 已在槽内(模拟开始时持有的那张)则不再入槽——它的占位是既成事实
+  if (!preexisting.some(id => id === launcherId)) digAndTake(launcherId);
+  digAndTake(targetId);
+
+  // ── 清槽:槽内出不去的牌,只在槽内与当前可点牌中找伴 ──
+  let acted = true;
+  let guard = 0;
+  while (acted && guard++ < view.perceived.length + 4) {
+    acted = false;
+    const click = clickableNow();
+    // 按入槽序逐张检查(每轮重读,消除后序号变化)
+    for (let i = 0; i < slot.length; i++) {
+      const x = slot[i];
+      const e = elemOf.get(x);
+      if (e === undefined || e === UNKNOWN_ELEMENT) continue;
+      // 槽内已有伴 → settle 已处理(或本轮稍后处理);只找可点伴
+      const mate = click.find(id => onPile(id) && elemOf.get(id) === e);
+      if (mate !== undefined) { take(mate); acted = true; break; }
+    }
   }
 
-  return { cost, mateOf, ambient, closureMates, dispositionCount };
+  for (const id of slot) residual.push(id);
+  return { peak, preexisting, occupancy, residual, steps };
 }
 
 // ─────────────────────────── 揭示预演(③决策的前向模型,主观) ───────────────────────────

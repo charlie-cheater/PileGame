@@ -152,7 +152,7 @@ export function runAgent(board: Board, params: AgentParams = {}): RunReport {
       operation: operation
         ? { rule: operation.reason.rule, note: operation.reason.note,
             utility: operation.reason.utility, runnerUp: operation.reason.runnerUp,
-            chain: operation.reason.chain,
+            chain: operation.reason.chain, delta: operation.reason.delta,
             expectation: operation.expectation }
         : undefined,
     });

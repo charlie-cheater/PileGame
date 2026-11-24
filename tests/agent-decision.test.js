@@ -14,7 +14,8 @@ const { Board } = require('../temp/v3check/core/Board');
 const { perceive } = require('../temp/v3check/agent/Perception');
 const { analyze, simulateReveal } = require('../temp/v3check/agent/Analysis');
 const { decideByLadder, ladderPolicy, slotCloseRung, pairCompleteRung, chainRung, wanderRung,
-  defaultLadder, scorePick } = require('../temp/v3check/agent/Ladder');
+  defaultLadder, scorePick, pickDelta, simulateAnalysisAfterPick, simulateViewAfterPick,
+  comparePickDelta, deltaScore } = require('../temp/v3check/agent/Ladder');
 const { runAgent } = require('../temp/v3check/agent/Runner');
 
 let pass = 0, fail = 0;
@@ -92,6 +93,44 @@ console.log('— 梯语义:slot-close / pair-complete / wander —');
     op.expectation.pairCompletes === true && op.expectation.slotAfter === 0
     && op.expectation.confidence === 'certain');
 
+  // slot-close 候选来源 = MatchReport 的 close 型(2026-11-24):
+  //   动作 = 该匹配的 target;reason 携带 matchCost / 空槽数
+  {
+    const closes = ctx.analysis.matches.opportunities.filter(o => o.type === 'close');
+    check('slot-close 候选来自 MatchReport:恰 1 个 close 型,动作 = 其 target',
+      closes.length === 1 && closes[0].launcher.inSlot
+      && op.action.tileId === closes[0].target.tileId);
+    check('slot-close reason 注明消耗:close 型峰值 1 / 空槽数 3',
+      closes[0].matchCost === 1 && ctx.analysis.matches.emptySlots === 3
+      && op.reason.note.includes('消耗 1/3 格'),
+      `note="${op.reason.note}"`);
+  }
+
+  // slot-close 边界:槽内持伴但伴被压 → MatchReport 为 hold 型(launcher 在槽内)
+  //   → slot-close 让位(行为边界不变,归后续梯);即便该 hold 型可执行也不收。
+  //   几何(X 放 (2,2,L1),端到端搜索核实 176 组有效偏移中取一):X 位于 E1b 下方,
+  //   其**侧面**擦到 E1b 下沿(侧边免阈 → E1b 不可点),E1b 顶面仍大部分可见。
+  //   注意两个坑:满压会让 E1b 完全不可见 → 不进感知集 → 报告里没有 E1;
+  //   X 若横向压到 E1b 上方则同时压住 E1a → E1a 不可点、无法入槽
+  {
+    const bHeld = new Board(level(50, 40, [
+      ['E1', 0, 10, 0], ['E1', 9, 10, 0], ['E2', 18, 10, 0], ['E2', 27, 10, 0],
+      ['X', 2, 2, 1],
+    ]));
+    const picked = bHeld.pick(0);           // E1a 入槽
+    const ctxHeld = buildCtx(bHeld);
+    const held = ctxHeld.analysis.matches.opportunities.find(o => o.elementId === 'E1');
+    const preOk = picked.ok && bHeld.slotCount() === 1
+      && held !== undefined && held.type === 'hold' && held.launcher.inSlot
+      && held.target.tileId === 1 && held.target.revealCount > 0;
+    check('边界·前置:E1a 入槽;伴 E1b 被压 → MatchReport 记为 hold 型(launcher 在槽内,target = E1b)',
+      preOk,
+      `pick=${picked.reason ?? 'ok'} slot=${bHeld.slotCount()} type=${held?.type} launcherInSlot=${held?.launcher.inSlot} target=${held?.target?.tileId} targetClosure=${held?.target?.revealCount}`);
+    check('边界:伴被压时 slot-close 让位(不收 hold 型,即便可执行)',
+      preOk && held.executable === true && slotCloseRung.decide(ctxHeld) === null,
+      `held.executable=${held?.executable} peak=${held?.matchCost} empty=${ctxHeld.analysis.matches.emptySlots}`);
+  }
+
   // pair-complete:无槽双亮对 → 预期不闭对(伴在堆不在槽)
   const ctx2 = buildCtx(new Board(board));
   const op2 = pairCompleteRung.decide(ctx2);
@@ -164,6 +203,83 @@ console.log('— Runner 集成:defaultLadder 通关 + 预期对账 + 可重放 �
   check('legacy 路径不受影响(operation 为空,终局合法)',
     legacy.steps.every(s => s.operation === undefined)
     && ['cleared', 'slot_full', 'no_clickable'].includes(legacy.outcome));
+}
+
+console.log('— 拾取差分 pickDelta:三级字典序 + 预演范围 + 纯函数 —');
+{
+  const D = (newExecutable, upgrades, peakDrop) => ({ newExecutable, upgrades, peakDrop, detail: null });
+
+  // 一、三级优先级(2026-11-24 设计裁定):新增可执行 > 类型升级 > 峰值下降总量
+  check('第 1 级优先:新增可执行 1 个胜过任意多的升级与峰值下降',
+    comparePickDelta(D(1, 0, 0), D(0, 99, 9999)) > 0);
+  check('第 2 级优先:升级 1 次胜过任意多的峰值下降',
+    comparePickDelta(D(0, 1, 0), D(0, 0, 9999)) > 0);
+  check('第 3 级兜底:前两级持平时比峰值下降总量',
+    comparePickDelta(D(0, 0, 5), D(0, 0, 3)) > 0);
+  check('三级全同 → 平级(由调用方按 tileId 决胜)',
+    comparePickDelta(D(2, 1, 4), D(2, 1, 4)) === 0);
+  check('反向:被超越者返回负数',
+    comparePickDelta(D(0, 0, 1), D(0, 1, 0)) < 0);
+  check('标量化与字典序保序:deltaScore 的大小关系与 comparePickDelta 一致',
+    [D(1, 0, 0), D(0, 99, 9999), D(0, 1, 0), D(0, 0, 9999), D(0, 0, 3)].every((a, _, arr) =>
+      arr.every(b => Math.sign(comparePickDelta(a, b)) === Math.sign(deltaScore(a) - deltaScore(b)))));
+
+  // 二、纯函数:预演不修改原主观视图与真实 Board(无需状态恢复)
+  {
+    const b = new Board(flatLevel());
+    b.pick(0); b.pick(2);                         // 槽内 2 张
+    const v = perceive(b);
+    const ctx = buildCtx(b);
+    const snapView = JSON.stringify(v.perceived.map(t => [t.tileId, t.elementId, t.status, t.slotIndex]))
+      + JSON.stringify(v.slot.map(t => [t.tileId, t.elementId, t.slotIndex]));
+    const snapBoard = JSON.stringify(b.allTiles().map(t => [t.tileId, t.status, t.slotIndex]));
+    for (const t of ctx.clickable) { pickDelta(t.tileId, ctx); simulateViewAfterPick(t.tileId, v); }
+    const viewNow = JSON.stringify(v.perceived.map(t => [t.tileId, t.elementId, t.status, t.slotIndex]))
+      + JSON.stringify(v.slot.map(t => [t.tileId, t.elementId, t.slotIndex]));
+    check('纯函数:多次预演后原主观视图逐字段不变',
+      viewNow === snapView, `before=${snapView} after=${viewNow}`);
+    check('纯函数:多次预演后真实 Board 不变',
+      JSON.stringify(b.allTiles().map(t => [t.tileId, t.status, t.slotIndex])) === snapBoard);
+    check('预演结果不共享可变结构:返回视图的 slot 是新对象',
+      simulateViewAfterPick(ctx.clickable[0].tileId, v).slot[0] !== v.slot[0]);
+  }
+
+  // 三、槽内状态纳入预演:闭对离场 → 合并后的资源余量
+  //   盘:槽内 E1a(0)、E3a(4);E1b(1) 可点。拿 E1b 与 E1a 闭对 → 槽 2 → 1,空槽 2 → 3
+  {
+    const b = new Board(flatLevel());
+    b.pick(0); b.pick(4);
+    const ctx = buildCtx(b);
+    const sim = simulateAnalysisAfterPick(1, ctx);
+    check('闭对离场:预演后槽内 2 → 1(E1a 与 E1b 一并离场),空槽 2 → 3',
+      ctx.view.slot.length === 2 && sim.matches.emptySlots === 3
+      && !sim.matches.opportunities.some(o => o.elementId === 'E1'));
+    const d = pickDelta(1, ctx);
+    check('差分:E1 自身的匹配消失(E1:close 闭对离场);无新增可执行、无升级',
+      d.detail.disappeared.join(',') === 'E1:close' && d.newExecutable === 0 && d.upgrades === 0,
+      `detail=${JSON.stringify(d.detail)}`);
+  }
+
+  // 四、预演范围:只在当前感知集上——新露出的牌不进预演(2026-11-24 设计裁定)
+  //   盘:Q(0)@(8,2,L0) 被 P(1)@(8,2,L1) 满压(Q 完全不可见);P 可点。
+  //   拿 P 后 Q 真实会露出,但预演看不到 Q:感知集只少 P,不会多出 Q
+  {
+    const b = new Board(level(24, 24, [['Q', 8, 2, 0], ['P', 8, 2, 1]]));
+    const ctx = buildCtx(b);
+    check('前置:Q 被 P 满压,不在感知集;感知集仅 P,且 P 可点',
+      !ctx.view.perceived.some(t => t.elementId === 'Q') && ctx.view.perceived.length === 1
+      && ctx.clickable.length === 1 && ctx.clickable[0].elementId === 'P');
+    const simView = simulateViewAfterPick(1, ctx.view);
+    check('预演只在当前感知集上:拿 P 后预演的牌堆为空、P 入槽,不含尚未露出的 Q',
+      simView.perceived.length === 0 && simView.slot.length === 1 && simView.slot[0].elementId === 'P',
+      `perceived=${JSON.stringify(simView.perceived.map(t => t.elementId))} slot=${JSON.stringify(simView.slot.map(t => t.elementId))}`);
+    // 对照:真实执行后 Q 进入感知集(由下一轮 ①感知 → ②分析 纳入)
+    b.pick(1);
+    const after = perceive(b);
+    check('对照:真实执行后 Q 进入感知集(操作落定后由新一轮分析纳入)',
+      after.perceived.length === 1 && after.perceived[0].elementId === 'Q',
+      `perceived=${JSON.stringify(after.perceived.map(t => t.elementId))}`);
+  }
 }
 
 // 几何备忘:TILE 8×10、侧面 2;blocked = 覆盖并集 > 14.4 unit²(≥15)或跨层侧边擦及。
@@ -396,23 +512,40 @@ console.log('— 平级择优:揭示预演两路求和(Σ激活 0.7 / Σ近点 0
     `pick=${op.action.tileId} u=${op.reason.utility} ru=${op.reason.runnerUp?.score}`);
 }
 {
-  // slot-close 择优:两个可闭对并存,其一顺带揭出一张「又能闭」的牌
-  //   cA(3)'A'@(0,12,L1) 压 x(4)'Z'@(0,2,L0)(16);cB(5)'B'@(16,24,L1) 不压任何牌
+  // slot-close 择优(拾取差分,2026-11-24):两个可闭对并存,其一顺带让另一匹配升级
+  //   cA(3)'A'@(0,12,L1) 压 x(4)'Z'@(0,2,L0)(x 暴露 80%,被压但在感知集);
+  //   cB(5)'B'@(16,24,L1) 不压任何牌
   //   槽:sA(0)'A' sB(1)'B' sZ(2)'Z'(均 @(16..32, 2..22) L0,互不重叠)
+  //   拿 cA:x 变可点,而槽内有 sZ → 匹配 Z: hold→close(类型升级 +1);拿 cB:无升级
   const b = new Board(level(32, 36, [
     ['A', 16, 2, 0], ['B', 24, 2, 0], ['Z', 16, 12, 0], ['A', 0, 12, 1], ['Z', 0, 2, 0], ['B', 16, 24, 1],
   ]));
   b.pick(0); b.pick(1); b.pick(2);
   const ctx = buildCtx(b);
   const op = decideByLadder([slotCloseRung], ctx);
-  check('slot-close 择优:闭对同时揭出一张 closes 的候选胜(cA,0.70;次优 cB,0)',
-    op.action.tileId === 3 && near(op.reason.utility, 0.7)
-    && op.reason.runnerUp && op.reason.runnerUp.tileId === 5 && op.reason.runnerUp.score === 0,
-    `pick=${op.action.tileId} u=${op.reason.utility} ru=${op.reason.runnerUp?.score}`);
+  check('slot-close 择优:带出类型升级的候选胜(拿 cA → Z: hold→close;次优 cB 无升级)',
+    op.action.tileId === 3 && op.reason.delta !== undefined
+      && op.reason.delta.newExecutable === 0 && op.reason.delta.upgrades === 1
+      && op.reason.delta.detail.upgraded.join(',') === 'Z:hold→close'
+      && op.reason.runnerUp && op.reason.runnerUp.tileId === 5
+      && op.reason.utility > op.reason.runnerUp.score,
+    `pick=${op.action.tileId} delta=${JSON.stringify(op.reason.delta)} ru=${JSON.stringify(op.reason.runnerUp)}`);
   check('该操作预期:闭对(slotAfter 3−1 = 2)且 forecast 预演揭出的 x 为 closes',
     op.expectation.pairCompletes && op.expectation.slotAfter === 2
     && op.expectation.exposes.length === 1 && op.expectation.exposes[0] === 4
     && op.expectation.forecast.clickable[0].activation === 'closes');
+  check('差分明细:拿 cA 使 A:close 消失(自身闭对离场);Z 拾取前已可执行故不计「新增」',
+    op.reason.delta.detail.disappeared.join(',') === 'A:close'
+      && op.reason.delta.detail.newExecIds.length === 0,
+    `detail=${JSON.stringify(op.reason.delta.detail)}`);
+  // 合并后的资源余量:拾取前空槽 1,预演闭对后为 2——可执行性按合并后的余量判定
+  {
+    const ctxX = buildCtx(b);
+    const sim = simulateAnalysisAfterPick(3, ctxX);
+    check('预演用合并后的资源余量:拾取前空槽 1 → 闭对离场后 2;后续匹配按此判定',
+      ctxX.analysis.matches.emptySlots === 1 && sim.matches.emptySlots === 2
+        && sim.matches.opportunities.every(o => o.executable));
+  }
 }
 // 平分确定性:对称盘 → tileId 小者(两梯各验一次)
 {

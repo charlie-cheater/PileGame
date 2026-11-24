@@ -43,7 +43,7 @@ graph TD
 | [split-symbol](nodes/split-symbol.md) | ✅ 数据层就绪(L/R)/ ⏳ 视觉未启用(当前为全图对) | 配对=互补相认:完整元素的二分,完形示能 |
 | [reward-loop](nodes/reward-loop.md) | 🟡 v1 已实现(吸引+爆闪);开盒/玩具弹出未做 | 配对→拼合→发亮→开盒→玩具飞入图鉴 |
 | [toy-economy](nodes/toy-economy.md) | 🟡 框架确认,细节未定 | 玩具宇宙、稀有度三档、重复转脑力、对接收藏图鉴 |
-| [level-generation](nodes/level-generation.md) | 🟡 求解器①~④已实现(③决策扫描梯 v1,2026-11-23),「需更多资源的 match」建模待裁定;⑤对账与规划器未动工 | 仿真玩家代理×渐进式规划器闭环;现阶段全图匹配(FULL),元素重复度为主轴 |
+| [level-generation](nodes/level-generation.md) | 🟡 求解器①~④已实现并迭代(③决策扫描梯 v1,2026-11-23;匹配消耗改为消除模拟 + 拾取差分择优,2026-11-24);③决策逐梯改造中(第一阶梯已完成);⑤对账与规划器未动工 | 仿真玩家代理×渐进式规划器闭环;现阶段全图匹配(FULL),元素重复度为主轴 |
 
 ## 关系表(边)
 

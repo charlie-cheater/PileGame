@@ -225,37 +225,35 @@ export function attachAgentDebug(pile: PileView, board: Board, opts: AgentDebugO
       info2.string = '身份未识别(?)——不参与匹配计算';
       return;
     }
-    const revealN = result.derived.get(tileId)?.clickable
-      ? 0 : (result.closureSize.get(tileId) ?? 0);
-    const revealD = result.derived.get(tileId)?.clickable
-      ? 0 : (result.depth.depth.get(tileId) ?? 0);
-    const acquire = 1 + (revealN + revealD) / 2;
-    const fmt = (n: number): string => Number.isInteger(n) ? String(n) : n.toFixed(1);
+    const op = matches.opportunities.find(o => o.elementId === t.elementId);
 
-    // 揭露闭包成员高亮(需先移除的牌,紫框;按需 DFS)
-    if (revealN > 0) {
-      const closure = new Set<number>();
-      const stack = [...(result.blockersOf.get(tileId) ?? [])];
-      while (stack.length > 0) {
-        const id = stack.pop()!;
-        if (closure.has(id)) continue;
-        closure.add(id);
-        (result.blockersOf.get(id) ?? []).forEach(b => stack.push(b));
-      }
+    // 匹配存在时:挖掘区成员紫框;模拟结束时卡在槽里的剩余牌 橙色粗框(真正占槽的)
+    if (op) {
+      const inResidual = new Set(op.cost.residual);
       hl.lineWidth = 2.5;
       hl.strokeColor = new Color(190, 130, 255, 170);
-      closure.forEach(id => {
+      for (const id of op.cost.region) {
+        if (id === tileId || inResidual.has(id)) continue;
         const b = board.getTile(id);
-        if (!b) return;
+        if (!b) continue;
         const tc = toPx(b.gx, b.gy);
         hl.roundRect(tc.x - w / 2 + 8, tc.y - h / 2 + 8, w - 16, h - 16, 5);
         hl.stroke();
-      });
+      }
+      hl.lineWidth = 4;
+      hl.strokeColor = new Color(255, 150, 40, 235);
+      for (const id of op.cost.residual) {
+        const b = board.getTile(id);
+        if (!b) continue;
+        const tc = toPx(b.gx, b.gy);
+        hl.roundRect(tc.x - w / 2 + 4, tc.y - h / 2 + 4, w - 8, h - 8, 6);
+        hl.stroke();
+      }
     }
 
-    const op = matches.opportunities.find(o => o.elementId === t.elementId);
     if (!op) {
-      info2.string = `获取成本 ${fmt(acquire)}(闭包 ${revealN}·深度 ${revealD})· 无可见匹配(伴不可见)`;
+      const closureN = result.derived.get(tileId)?.clickable ? 0 : (result.closureSize.get(tileId) ?? 0);
+      info2.string = `闭包 ${closureN} 张 · 无可见匹配(伴不可见)`;
       return;
     }
     const isLauncher = op.launcher.tileId === tileId;
@@ -275,12 +273,19 @@ export function attachAgentDebug(pile: PileView, board: Board, opts: AgentDebugO
     }
 
     const role = isLauncher ? '启动牌' : isTarget ? '目标牌' : '候选外第三张';
-    info2.string = `获取成本 ${fmt(acquire)}(闭包 ${revealN}·深度 ${revealD})`
-      + ` · 匹配[${op.type}] 本牌=${role}`
+    info.string = `选中:${nameOf(tileId)} @L${t.layer} · 揭露效能 ${targets.length}`
+      + ` · 直接遮挡:${targetNames.length ? targetNames.join('、') : '无'}`
+      + ` · ${result.derived.get(tileId)?.clickable ? '可点' : '被压'}`
+      + ` · ${op.executable ? '✓可执行' : `✗需 ${op.matchCost - matches.emptySlots} 格`}`;
+    info2.string = `匹配[${op.type}] 本牌=${role}`
       + (partnerId !== null
-        ? ` · 搭档 ${nameOf(partnerId)}@L${board.getTile(partnerId)!.layer}(成本 ${fmt(isLauncher ? op.target.acquireCost : op.launcher.acquireCost)})`
+        ? ` · 搭档 ${nameOf(partnerId)}@L${board.getTile(partnerId)!.layer}`
         : '')
-      + ` · 总消耗 ${fmt(op.matchCost)} · 空槽 ${matches.emptySlots}`;
+      + ` · 消耗 ${op.matchCost}/${matches.emptySlots} 格(峰值)`
+      + ` · 占用 ${op.cost.occupancy.join('›')}`
+      + ` · 剩 ${op.cost.residual.length} 张`
+      + (op.cost.residual.length
+        ? `(${op.cost.residual.map(nameOf).join('、')})` : '');
   };
 
   for (const child of pile.node.children) {

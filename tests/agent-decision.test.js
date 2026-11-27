@@ -11,9 +11,12 @@
 // ============================================================================
 
 const { Board } = require('../temp/v3check/core/Board');
+const { buildFilledLevel } = require('../temp/v3check/core/RandomFill');
+const LAYOUT = require('../assets/data/layouts/test_layout.json');
 const { perceive } = require('../temp/v3check/agent/Perception');
-const { analyze, simulateReveal } = require('../temp/v3check/agent/Analysis');
-const { decideByLadder, ladderPolicy, slotCloseRung, pairCompleteRung, digRung, selectDigMatch,
+const { analyze, simulateReveal, verifyMatches } = require('../temp/v3check/agent/Analysis');
+const { decideByLadder, ladderPolicy, slotCloseRung, pairCompleteRung, digRung, selectDigMatch, selectDig,
+  compareDigMatch, advanceOf,
   exploreRung, wanderRung, defaultLadder, pickDelta, simulateAnalysisAfterPick, simulateViewAfterPick,
   comparePickDelta, deltaScore } = require('../temp/v3check/agent/Ladder');
 const { runAgent } = require('../temp/v3check/agent/Runner');
@@ -23,6 +26,7 @@ function check(name, cond, detail) {
   if (cond) { pass++; console.log(`  ✓ ${name}`); }
   else { fail++; console.error(`  ✗ ${name}  ${detail ?? ''}`); }
 }
+
 
 /** 最小合成牌 */
 const mkT = (tileId, elementId, gx, gy, layer) =>
@@ -127,10 +131,11 @@ console.log('— 梯语义:slot-close / pair-complete / wander —');
     check('边界 A·前置:E1a 入槽;伴 E1b 被压 → MatchReport 记为 hold 型(launcher 在槽内,target = E1b)',
       preOk,
       `pick=${picked.reason ?? 'ok'} slot=${bHeld.slotCount()} type=${held?.type} launcherInSlot=${held?.launcher.inSlot} target=${held?.target?.tileId} targetClosure=${held?.target?.revealCount}`);
+    const hv = held !== undefined ? verifyMatches(ctxHeld.view, ctxHeld.analysis, [held])[0] : null;
     check('边界 A:伴被压时 slot-close 让位(不收 hold 型,即便可执行);计划 = 先拿压它的 X 再拿伴',
-      preOk && held.executable === true && held.cost.picks.join(',') === '4,1'
+      preOk && hv !== null && hv.executable === true && hv.cost.picks.join(',') === '4,1'
       && slotCloseRung.decide(ctxHeld) === null,
-      `held.executable=${held?.executable} peak=${held?.matchCost} picks=${held?.cost.picks.join(',')} empty=${ctxHeld.analysis.matches.emptySlots}`);
+      `held.type=${held && held.type} peak=${hv && hv.matchCost} picks=${hv && hv.cost.picks.join(',')} empty=${ctxHeld.analysis.matches.emptySlots}`);
   }
 
   // slot-close 边界 B:伴**可点但闭包不为 0**(只被不足阈值的细条盖住)→ 按可点性判为 close 型。
@@ -228,8 +233,10 @@ console.log('— Runner 集成:defaultLadder 通关 + 预期对账 + 可重放 �
   check('预期对账:pairCompletes === 实际 paired,slotAfter === 实际槽位',
     r1.steps.every(s => s.operation.expectation.pairCompletes === s.paired
       && s.operation.expectation.slotAfter === s.slotAfter));
-  check('逐对交替节奏:偶数步 pair-complete / 奇数步 slot-close',
+  check('逐对交替节奏:偶数步 pair-complete(握半启动)/ 奇数步 slot-close(闭合)',
     r1.steps.every((s, i) => s.operation.rule === (i % 2 === 0 ? 'pair-complete' : 'slot-close')));
+  check('默认梯四梯:slot-close → pair-complete → dig → explore(启动梯已于 2026-11-25 移除)',
+    defaultLadder.map(r => r.rule).join('→') === 'slot-close→pair-complete→dig→explore');
 
   const r2 = runAgent(new Board(flatLevel()), { seed: 7, decision: ladderPolicy() });
   check('同 seed 同梯可重放(选牌与规则逐字段一致)',
@@ -397,12 +404,13 @@ console.log('— 揭示预演 simulateReveal:clickable 的激活类型 —');
     JSON.stringify(ff.nonClickable));
 }
 
-console.log('— dig 梯(基础数据选择):候选来源 / 排序占位 / 动作 / 门槛 / 端到端 —');
+console.log('— dig 梯(基础数据选择):候选来源 / 排序 / 动作 / 门槛 / 端到端 —');
 // 2026-11-24:原 chain 梯整体移除——借槽两步闭合的两类机会在 MatchReport 中均为
-// 可执行的 hold 型匹配(峰值 2),由 dig 梯(除 close / double 外的可执行匹配)覆盖。
-// 匹配间的排序待设计裁定,现暂取 MatchReport 既有顺序(消耗升序,同消耗按 elementId)。
+// 可执行的 hold 型匹配(峰值 2),由 dig 梯(除 close / double 外的匹配)覆盖。
+// 2026-11-25:报告期全量清单,且对所有 hold / dig 配对逐条验算(消耗与滞留牌);
+// dig 出手时直接读报告择优:可执行 → 槽内遗留最少 → 首牌拾取差分最优。
 {
-  // DG1 候选来源:close 型、double 型、不可执行的匹配都不收
+  // DG1 候选来源:close 型、double 型归前两梯;可执行的 hold / dig 型归 dig 梯
   //   槽:u0(0)'U' x0(4)'X';u(1)'U' 可点 → U 为 close;p(2) p(3)'P' → double
   //   b(5)'X' 被 a(6)'A'@(40,12,L1) 压 → X 为 hold(峰值 2,空槽 2 → 可执行)
   //   z(7) 被 n(8) 压、z'(9) 被 n'(10) 压 → Z 为 dig(峰值 4 > 2 → 不可执行)
@@ -411,29 +419,31 @@ console.log('— dig 梯(基础数据选择):候选来源 / 排序占位 / 动�
     ['Z', 72, 2, 0], ['N2', 72, 12, 1]]));
   b.pick(0); b.pick(4);
   const ctx = buildCtx(b);
-  const byType = ctx.analysis.matches.opportunities.map(o => `${o.elementId}:${o.type}:${o.executable}`).join(' ');
-  check('前置:U 为 close、P 为 double、X 为 hold(可执行)、Z 为 dig(不可执行);空槽 2',
-    byType === 'U:close:true P:double:true X:hold:true Z:dig:false' && ctx.analysis.matches.emptySlots === 2,
-    byType);
-  check('候选来源:只选出可执行的 hold / dig → 唯一候选 X',
+  const shown = ctx.analysis.matches.opportunities.map(o =>
+    `${o.elementId}:${o.type}${o.executable ? ':可执行' : ':不可执行'}`).join(' ');
+  check('前置:报告全量清单逐条验算——U close(可执行)、P double(可执行)、X hold(可执行)、Z dig(不可执行);空槽 2',
+    shown === 'U:close:可执行 P:double:可执行 X:hold:可执行 Z:dig:不可执行' && ctx.analysis.matches.emptySlots === 2,
+    shown);
+  check('候选来源:可执行的 hold / dig 归 dig 梯 → 唯一可选 X',
     (selectDigMatch(ctx) || {}).elementId === 'X');
   const op = digRung.decide(ctx);
   check('dig 出手:rule = dig,reason.match 结构化记录所选匹配(X / hold / 启动 4 / 目标 5 / 消耗 2)',
     op !== null && op.reason.rule === 'dig' && op.action.tileId === 6
       && JSON.stringify(op.reason.match) === JSON.stringify({ elementId: 'X', type: 'hold', launcher: 4, target: 5, matchCost: 2 }),
-    `pick=${op && op.action.tileId} match=${JSON.stringify(op && op.reason.match)}`);
+    `pick=${op && op.action.tileId} match=${op && JSON.stringify(op.reason.match)}`);
     // 2026-11-25 来源规则:模拟开始时槽内原有的牌只跟闭包内的牌配。
     //   旧实现在算 X 的 hold 时,会顺手把槽内原有的 0(U)跟可点的 1(U)消掉 ——
     //   那是 U 的 close,混进了 X 的账里,计划因此多出 2 步。现在不消,计划只剩 2 步。
-    check('reason 注明消耗与空槽数、计划步数',
-      op.reason.note.includes('消耗 2/2 格') && op.reason.note.includes('计划 2 步'),
+    check('reason 注明消耗与空槽数、到配对完成的拿牌数、候选规模',
+      op.reason.note.includes('消耗 2/2 格') && op.reason.note.includes('到配对完成 2 拿')
+      && op.reason.note.includes('候选 1/2 对'),
       `note="${op.reason.note}"`);
     check('来源规则:X 的计划只含挖掘动作(拿 6 挖开 5 → 拿 5 与槽内 4 配),不夹带原有槽内牌 0 的配对',
-      JSON.stringify(ctx.analysis.matches.byElement.get('X')[0].cost.picks) === '[6,5]',
-      `picks=${JSON.stringify(ctx.analysis.matches.byElement.get('X')[0].cost.picks)}`);
+      JSON.stringify(ctx.analysis.matches.opportunities.find(o => o.elementId === 'X').cost.picks) === '[6,5]',
+      `picks=${JSON.stringify(ctx.analysis.matches.opportunities.find(o => o.elementId === 'X').cost.picks)}`);
 }
 {
-  // DG2 排序(占位):暂取 MatchReport 既有顺序——消耗升序
+  // DG2 排序:可执行 → 槽内遗留最少 →(同遗留)首牌差分 → 首牌 tileId → elementId
   //   槽:x0(0)'X';b(1)'X' 被 a(2)'A'@(8,12,L1) 压 → X 为 hold(峰值 2)
   //   y(3)'Y' 可点,y'(4)'Y' 被 b'(5)'B'@(32,12,L1) 压 → Y 为 hold(峰值 3)
   const b = new Board(level(48, 24, [['X', 0, 2, 0], ['X', 8, 2, 0], ['A', 8, 12, 1],
@@ -445,11 +455,11 @@ console.log('— dig 梯(基础数据选择):候选来源 / 排序占位 / 动�
     costs === 'X:hold:2 Y:hold:3' && ctx.analysis.matches.emptySlots === 3, costs);
   check('排序:遗留少者先(X 遗留 1 张 < Y 的 2 张;恰与消耗同序)→ 选 X,动作 = 其计划第一步 a(2)',
     (selectDigMatch(ctx) || {}).elementId === 'X' && digRung.decide(ctx).action.tileId === 2);
-  // 同遗留同消耗并列 → 按 elementId(L 与 T 遗留各 1 张、消耗同 3 格)
+  // 同遗留同消耗并列、结构对称(首牌差分并列)→ 首牌 tileId 小者先(L 的首牌 0 < T 的 3)
   const ctxT = buildCtx(new Board(level(48, 24, [['L', 0, 2, 0], ['L', 8, 2, 0], ['M', 0, 12, 1],
     ['T', 24, 2, 0], ['T', 32, 2, 0], ['N', 24, 12, 1]])));
-  check('排序:同遗留同消耗并列 → 按 elementId(L 先于 T)',
-    ctxT.analysis.matches.opportunities.map(o => `${o.elementId}:${o.matchCost}`).join(' ') === 'L:3 T:3'
+  check('排序:同遗留同消耗、首牌差分并列 → 首牌 tileId 小者先(L 的首牌 0 < T 的 3)',
+    ctxT.analysis.matches.opportunities.map(o => `${o.elementId}:${o.type}`).join(' ') === 'L:hold T:hold'
       && (selectDigMatch(ctxT) || {}).elementId === 'L');
 }
 {
@@ -473,17 +483,18 @@ console.log('— dig 梯(基础数据选择):候选来源 / 排序占位 / 动�
     z.type === 'dig' && z.matchCost === 4 && z.executable && z.cost.picks.join(',') === '1,0,3,2'
       && opD.action.tileId === 1
       && JSON.stringify(opD.reason.match) === JSON.stringify({ elementId: 'Z', type: 'dig', launcher: 0, target: 2, matchCost: 4 }),
-    `pick=${opD && opD.action.tileId} match=${JSON.stringify(opD && opD.reason.match)}`);
+    `pick=${opD && opD.action.tileId} match=${opD && JSON.stringify(opD.reason.match)}`);
 }
 {
-  // DG4 门槛:不可执行的匹配不收(空槽 1 时 hold 峰值 2 > 1)
+  // DG4 门槛:验算后不可执行的匹配不收(空槽 1 时 hold 峰值 2 > 1)
   const spec = [['X', 0, 2, 0], ['A', 0, 12, 1], ['X', 16, 2, 0], ['U', 24, 2, 0], ['V', 32, 2, 0]];
   const b = new Board(level(40, 24, spec));
   b.pick(2); b.pick(3); b.pick(4);
   const ctx = buildCtx(b);
   const only = ctx.analysis.matches.opportunities;
-  check('空槽 1:唯一的 hold 不可执行 → dig 让位',
-    ctx.analysis.matches.emptySlots === 1 && only.length === 1 && only[0].type === 'hold' && !only[0].executable
+  check('空槽 1:唯一的 hold 不可执行(报告期已验算,峰值 2 > 1)→ dig 让位',
+    ctx.analysis.matches.emptySlots === 1 && only.length === 1 && only[0].type === 'hold'
+      && only[0].cost !== undefined && only[0].executable === false
       && selectDigMatch(ctx) === null && digRung.decide(ctx) === null);
   // DG5 负例:只有 double(归 pair-complete)→ dig 让位
   const flat = buildCtx(new Board(flatLevel()));
@@ -491,9 +502,10 @@ console.log('— dig 梯(基础数据选择):候选来源 / 排序占位 / 动�
 }
 {
   // DG6 端到端(defaultLadder)
-  //   启动牌可点的 hold:dig 拿启动牌 → slot-close 闭合 → 清盘
+  //   启动牌可点的 hold:槽空、无 double → dig 握半启动 → slot-close 闭合 → 清盘
+  //   (启动梯已于 2026-11-25 移除;平盘的槽空首步由 pair-complete 接手,这里没有 double)
   const r = runAgent(new Board(level(16, 24, [['Y', 0, 2, 0], ['Y', 0, 12, 1]])), { seed: 7, decision: ladderPolicy() });
-  check('端到端·hold:dig → slot-close 闭合,2 pick 清盘',
+  check('端到端·hold:dig 握半启动 → slot-close 闭合,2 pick 清盘',
     r.outcome === 'cleared' && r.picks === 2 && r.steps.map(s => s.operation.rule).join('→') === 'dig→slot-close',
     r.steps.map(s => s.operation.rule).join('→'));
   //   级联(三层):a(3)'A'@(4,8,L2) 压 b(2)'X'@(0,2,L1);b 全压 a2(1)'A'@(0,2,L0);槽内 sX(0)'X'
@@ -515,6 +527,563 @@ console.log('— dig 梯(基础数据选择):候选来源 / 排序占位 / 动�
       && r6.steps.slice(0, 3).map(s => `${s.operation.match.type},${s.operation.match.matchCost}`).join('→') === 'dig,4→hold,3→hold,2'
       && r6.steps[3].paired === true,
     r6.steps.map(s => `${s.chosenTile}:${s.operation.rule}(${s.operation.match ? s.operation.match.type + ',' + s.operation.match.matchCost : ''})`).join('→'));
+  // 推进效能按「所拿的牌是否纯遮挡者」变化(数值经探针核实):1/5 → 0 → 1/2
+  //   两个遮挡者 n(1)、n'(3) 都无伴,谁被拿走谁就留在槽里。滞留按**拿前**计
+  //   第 1 拿 n(1):纯遮挡者,在闭包 [1,3] 里 → 拿后差 3;1、3 都会滞留 → 1/(3+2) = 1/5
+  //   第 2 拿 z(0):它是配对牌(可点的启动牌),不是纯遮挡者 → 效能 0。
+  //     dig 仍出这一手:此时唯一可执行配对的首牌就是它(闭包 [3] 里的 3 不是首牌)
+  //   第 3 拿 n'(3):纯遮挡者 → 拿后差 1、滞留 1 → 1/(1+1) = 1/2
+  check('端到端·dig 型:拿纯遮挡者才有效能(1/5 → 0 → 1/2),拿配对牌为 0;随操作落盘',
+    r6.steps.slice(0, 3).map(s => s.operation.advance.total).join(',') === [1 / 5, 0, 1 / 2].join(',')
+    && r6.steps.slice(0, 3).every(s => s.operation.utility === s.operation.advance.total),
+    r6.steps.map(s => `${s.operation.rule}:${s.operation.advance && s.operation.advance.total.toFixed(3)}`).join('→'));
+}
+
+console.log('— dig 梯:报告全量清单 + 出手时全部验算(2026-11-25 设计者定稿)—');
+// 报告期把每个元素的全部候选两两配对记录并分类(close / double 即验算;hold / dig 只
+// 分类不验算);dig 出手时对报告里的全部 hold / dig 配对验算(verifyMatches,与报告期
+// 同一条代码路径),按字典序择优:可执行 → 槽内遗留最少 → 首牌拾取差分最优。
+// 盘面几何先用探针逐一核实(temp/ 探针,未入库),再固化。
+{
+  // FS1 报告全量清单:同一元素的全部需挖掘配对都在(此前每元素只留获取成本最低的一条)
+  //   槽:sX(0)'X';q1(1)'X' 被 b(2)'B'、c(3)'C' 压;q2(4)'X' 被 e1(5)'E'、e2(6)'E' 压(E 两张互为伴)
+  const b = new Board(level(96, 24, [['X', 56, 2, 0], ['X', 8, 2, 0], ['B', 4, 12, 1], ['C', 12, 12, 1],
+    ['X', 32, 2, 0], ['E', 28, 12, 1], ['E', 36, 12, 1]]));
+  b.pick(0);
+  const ctx = buildCtx(b);
+  const xs = ctx.analysis.matches.byElement.get('X');
+  const e0 = ctx.analysis.matches.byElement.get('E')[0];
+  check('前置:报告为 X 记录全部 3 条需挖掘配对并逐条验算——(0,4) 峰值 2、(0,1) 峰值 3、(1,4) dig 峰值 5,按消耗升序;E 的 double 峰值 2',
+    xs.length === 3
+    && xs.map(o => `${o.launcher.tileId},${o.target.tileId}:${o.type}:${o.matchCost}:${o.executable}`).join(' ') === '0,4:hold:2:true 0,1:hold:3:true 1,4:dig:5:false'
+    && xs.every(o => o.cost !== undefined)
+    && e0.type === 'double' && e0.matchCost === 2 && e0.executable === true,
+    JSON.stringify(xs.map(o => [o.launcher.tileId, o.target.tileId, o.type, o.matchCost, o.executable])));
+  const op = digRung.decide(ctx);
+  check('dig 出手:直接读报告 → (0,4) 峰值 2、无遗留,胜过 (0,1) 峰值 3 遗留 2;动作 = 计划第一步 e1(5)',
+    op.action.tileId === 5
+    && JSON.stringify(op.reason.match) === JSON.stringify({ elementId: 'X', type: 'hold', launcher: 0, target: 4, matchCost: 2 }),
+    `pick=${op && op.action.tileId} match=${op && JSON.stringify(op.reason.match)}`);
+  check('清单事实落盘:报告 3 对、可执行 2、涉及 1 个元素;note 注明候选规模',
+    JSON.stringify(op.reason.scan) === JSON.stringify({ pairs: 3, executable: 2, elements: 1 })
+    && op.reason.note.includes('候选 2/3 对'),
+    `scan=${op && JSON.stringify(op.reason.scan)} note="${op && op.reason.note}"`);
+  check('dig 择优 = 首牌推进效能最大者:首牌 5 效能 0.5(路线 (0,4) 拿后差 2、无滞留)胜过首牌 2 的 0.25(路线 (0,1) 拿后差 2、滞留 2)',
+    op.action.tileId === 5 && op.reason.utility === 0.5
+    && JSON.stringify(op.reason.advance) === JSON.stringify({ total: 0.5, elements: [
+      { elementId: 'X', pairId: [0, 4], pairPicks: 2, residual: 0, offset: 0, executable: true, value: 0.5 }] })
+    && JSON.stringify(op.reason.runnerUp) === JSON.stringify({ tileId: 2, score: 0.25 }),
+    `utility=${op && op.reason.utility} advance=${op && JSON.stringify(op.reason.advance)} runnerUp=${op && JSON.stringify(op.reason.runnerUp)}`);
+  const v = verifyMatches(ctx.view, ctx.analysis, xs);
+  check('幂等重算:3 条的峰值 2 / 3 / 5,可执行 true / true / false;重复验算逐字段一致(确定性)',
+    v.map(o => `${o.matchCost}:${o.executable}`).join(' ') === '2:true 3:true 5:false'
+    && JSON.stringify(verifyMatches(ctx.view, ctx.analysis, v)) === JSON.stringify(v));
+  check('与报告期同一条代码路径:任一条目重算逐字段一致',
+    JSON.stringify(verifyMatches(ctx.view, ctx.analysis, [e0])) === JSON.stringify([e0]));
+}
+{
+  // FS3 每元素只有一条需挖掘配对:报告 1 条、可执行 1
+  //   槽:sX(0)'X';b(1)'X' 被 a(2)'A'@(0,12,L1) 压 → 报告 (0, 1) hold,峰值 2
+  const b = new Board(level(24, 24, [['X', 16, 2, 0], ['X', 0, 2, 0], ['A', 0, 12, 1]]));
+  b.pick(0);
+  const ctx = buildCtx(b);
+  const on = digRung.decide(ctx);
+  check('单条配对:候选 1/1 对;动作 = 模拟计划的第一步 a(2)',
+    on.action.tileId === 2
+    && JSON.stringify(on.reason.match) === JSON.stringify({ elementId: 'X', type: 'hold', launcher: 0, target: 1, matchCost: 2 })
+    && JSON.stringify(on.reason.scan) === JSON.stringify({ pairs: 1, executable: 1, elements: 1 })
+    && on.reason.note.includes('候选 1/1 对'),
+    `on=${JSON.stringify(on.reason.match)} ${JSON.stringify(on.reason.scan)}`);
+  // FS4 端到端:观测记录与推进效能随轨迹落盘(Runner → StepRecord.operation)。接上面的盘(槽内已有 0)
+  //   dig 拿 a(2) → slot-close 拿 1 闭合;之后只剩无伴的 a,无可点牌,终局 no_clickable
+  //   dig 步:路线拿后差 1、滞留 1(A 无伴)→ 效能 0.5;slot-close 步:所拿的 1 不在任何
+  //   hold / dig 的路径上(它自己那条已配掉)→ 效能 0
+  const b4 = new Board(level(24, 24, [['X', 16, 2, 0], ['X', 0, 2, 0], ['A', 0, 12, 1]]));
+  b4.pick(0);
+  const r = runAgent(b4, { seed: 7, decision: ladderPolicy() });
+  check('端到端:dig 步的轨迹带 operation.scan 与 operation.advance(0.5);slot-close 步带 advance(0)无 scan',
+    r.steps.length === 2 && r.steps.map(s => s.operation.rule).join('→') === 'dig→slot-close'
+    && JSON.stringify(r.steps[0].operation.scan) === JSON.stringify({ pairs: 1, executable: 1, elements: 1 })
+    && r.steps[0].operation.match.target === 1 && r.steps[0].operation.advance.total === 0.5
+    && r.steps[0].operation.utility === 0.5
+    && r.steps[1].operation.scan === undefined && r.steps[1].operation.advance.total === 0,
+    r.steps.map(s => `${s.operation.rule}:scan=${JSON.stringify(s.operation.scan)} advance=${s.operation.advance && s.operation.advance.total}`).join('→'));
+  // FS5 让位:无可执行的 hold / dig → 不出手;清单事实仍返回(可观测)
+  const b5 = new Board(level(40, 24, [['X', 0, 2, 0], ['A', 0, 12, 1], ['X', 16, 2, 0], ['U', 24, 2, 0], ['V', 32, 2, 0]]));
+  b5.pick(2); b5.pick(3); b5.pick(4);
+  const s5 = selectDig(buildCtx(b5));
+  check('dig 让位(无可执行):不出手;清单事实记 1 对、可执行 0',
+    s5.match === null && digRung.decide(buildCtx(b5)) === null
+    && JSON.stringify(s5.scan) === JSON.stringify({ pairs: 1, executable: 0, elements: 1 }),
+    `scan=${JSON.stringify(s5.scan)}`);
+  // FS6 无 hold / dig 配对:无清单事实、让位
+  const s6 = selectDig(buildCtx(new Board(flatLevel())));
+  check('只有 double 型(报告期已验算)→ dig 无 hold / dig 候选,让位且无清单记录',
+    s6.match === null && s6.scan === undefined);
+}
+{
+  // FS6b 角色互换不换身份(2026-11-25 报告契约):同一无序对在拾取前后角色互换、
+  //   类型升级,pairId 不变——身份与角色解耦,是逐 match 差分的前提
+  //   平盘 E1 = {0, 1}:launcher 0 / target 1;拿 target 1 入槽 → close(launcher 1 / target 0)
+  const b = new Board(flatLevel());
+  const ctx = buildCtx(b);
+  const before = ctx.analysis.matches.byElement.get('E1')[0];
+  check('角色互换前置:double(launcher 0, target 1),pairId [0,1]',
+    before.type === 'double' && before.launcher.tileId === 0 && before.target.tileId === 1
+    && JSON.stringify(before.pairId) === '[0,1]',
+    JSON.stringify(before.pairId));
+  const after = simulateAnalysisAfterPick(1, ctx);
+  const entry = after.matches.byElement.get('E1')[0];
+  check('角色互换:拿 target 入槽后同一条配对 → close(launcher 1, target 0),pairId 仍 [0,1]',
+    entry.type === 'close' && entry.launcher.tileId === 1 && entry.target.tileId === 0
+    && JSON.stringify(entry.pairId) === '[0,1]',
+    `type=${entry.type} L${entry.launcher.tileId}/T${entry.target.tileId} pairId=${JSON.stringify(entry.pairId)}`);
+}
+{
+  // FS7 「报告说做不了,换一对做得动」在全量清单下的形态:报告逐条验算,做得了的那条直接可选
+  //   槽:s(0)'S'。X:x1(1) 可点;x2(2) 被 p(3)、q(4) 压(各无伴);x3(5) 被 m1(6)、m2(7) 压(m1/m2 互为伴)
+  //   三条配对报告期全部验算:(1,2) 峰值 4、(2,5) 峰值 5 均超空槽 3,(1,5) 峰值 3 可执行
+  const b = new Board(level(72, 24, [['S', 56, 2, 0], ['X', 24, 2, 0], ['X', 8, 2, 0], ['P', 4, 12, 1], ['Q', 12, 12, 1],
+    ['X', 40, 2, 0], ['M', 36, 12, 1], ['M', 44, 12, 1]]));
+  b.pick(0);
+  const ctx = buildCtx(b);
+  const xs = ctx.analysis.matches.byElement.get('X');
+  check('前置:X 的 3 条配对全部验算、按消耗升序——(1,5) 峰值 3 可执行,(1,2) 峰值 4、(2,5) dig 峰值 5 不可执行',
+    xs.length === 3
+    && xs.map(o => `${o.launcher.tileId},${o.target.tileId}:${o.type}:${o.matchCost}:${o.executable}`).join(' ') === '1,5:hold:3:true 1,2:hold:4:false 2,5:dig:5:false',
+    JSON.stringify(xs.map(o => [o.launcher.tileId, o.target.tileId, o.type, o.matchCost, o.executable])));
+  const op = digRung.decide(ctx);
+  check('做得了的那条直接可选:(1,5) 峰值 3(m1/m2 进槽互配离场)→ 选它,拿 x1(1)',
+    op !== null && op.action.tileId === 1
+    && JSON.stringify(op.reason.match) === JSON.stringify({ elementId: 'X', type: 'hold', launcher: 1, target: 5, matchCost: 3 }),
+    `pick=${op && op.action.tileId} match=${op && JSON.stringify(op.reason.match)}`);
+  check('清单事实落盘:报告 3 对、可执行 1、1 个元素',
+    JSON.stringify(op.reason.scan) === JSON.stringify({ pairs: 3, executable: 1, elements: 1 }),
+    `scan=${op && JSON.stringify(op.reason.scan)}`);
+}
+{
+  // FS8 性质(小批量:14 元素 5 盘,默认梯走到终局,逐个 dig 决策时刻核对):
+  //   ① 报告里的 hold / dig 配对全部未验算;验算数 = 条目数,可执行数与元素数与实况一致
+  //   ② 有可执行时:选中者为可执行、有计划的 hold / dig,且为独立重算的字典序最优
+  //      (可执行 → 遗留最少 → 首牌差分最优 → 首牌 tileId → elementId → 启动牌 → 目标牌);
+  //      落盘差分 = 选中者首牌的差分
+  //   ③ 无可执行时:让位
+  const els = Array.from({ length: 14 }, (_, i) => ({ elementId: 'u' + (i + 1), displayName: '', color: '#fff' }));
+  const key = o => o.pairId.join('|');
+  const bad = [];
+  let digDecisions = 0;
+  for (let g = 0; g < 5; g++) {
+    const board = new Board(buildFilledLevel(LAYOUT.board, LAYOUT.tiles, { elements: els, seed: 1000 + g }));
+    for (let guard = 0; guard < 200; guard++) {
+      const ctx = buildCtx(board);
+      const s = selectDig(ctx);
+      const todo = ctx.analysis.matches.opportunities.filter(o => o.type === 'hold' || o.type === 'dig');
+      if (todo.length > 0) {
+        digDecisions++;
+        const where = `seed ${1000 + g} 第 ${guard} 步`;
+        // ① 报告期已逐条验算;清单事实与实况一致(可执行数用幂等重算独立核对)
+        if (!todo.every(o => o.cost !== undefined && o.executable !== undefined)) {
+          bad.push(`${where}:报告里的 hold / dig 应全部已验算`);
+        }
+        const verified = verifyMatches(ctx.view, ctx.analysis, todo);
+        const exec = verified.filter(o => o.executable === true && o.cost.picks.length > 0);
+        if (!s.scan || s.scan.pairs !== todo.length || s.scan.executable !== exec.length
+          || s.scan.elements !== new Set(todo.map(o => o.elementId)).size) {
+          bad.push(`${where}:清单记录 ${JSON.stringify(s.scan)} 与实况(报告 ${todo.length} / 可执行 ${exec.length})不符`);
+        }
+        // ② / ③
+        if (exec.length > 0) {
+          // 独立重算:候选 = 各可执行配对的首牌(去重);效能最大者,平分取首牌 tileId 小者
+          const firstIds = [...new Set(exec.map(o => o.cost.picks[0]))].sort((a, b) => a - b);
+          const refFirst = firstIds.slice().sort((a, b) =>
+            (advanceOf(b, ctx).total - advanceOf(a, ctx).total) || (a - b))[0];
+          const refAdv = advanceOf(refFirst, ctx);
+          if (!s.match) bad.push(`${where}:有可执行配对却让位`);
+          else {
+            if (s.match.executable !== true || !(s.match.type === 'hold' || s.match.type === 'dig')
+              || s.match.cost.picks.length === 0) {
+              bad.push(`${where}:选中者不是可执行、有计划的 hold / dig`);
+            }
+            const chosenFirst = s.match.cost.picks[0];
+            if (chosenFirst !== refFirst) bad.push(`${where}:选中首牌 ${chosenFirst} ≠ 效能最大者 ${refFirst}`);
+            // 所选配对必须是所选中首牌的某条可执行候选
+            if (!exec.some(o => key(o) === key(s.match) && o.cost.picks[0] === chosenFirst)) {
+              bad.push(`${where}:所选配对 ${key(s.match)} 不是首牌 ${chosenFirst} 的可执行候选`);
+            }
+            if (JSON.stringify(s.advance) !== JSON.stringify(refAdv)) bad.push(`${where}:落盘效能 ≠ 首牌效能`);
+          }
+        } else if (s.match !== null) {
+          bad.push(`${where}:无可执行配对却出手`);
+        }
+      }
+      const step = decideByLadder(defaultLadder, ctx);
+      const pick = board.pick(step.action.tileId);
+      if (!pick.ok) break;
+      if (pick.paired) { board.eliminate(pick.paired[0], pick.paired[1]); board.compactSlots(); }
+      if (board.isCleared() || (board.isSlotFull() && !board.findSlotPair())) break;
+    }
+  }
+  check(`性质:5 盘共 ${digDecisions} 个 dig 决策时刻,报告 / 择优 / 记录三对口零违反`,
+    digDecisions >= 20 && bad.length === 0, bad.slice(0, 4).join('\n       '));
+}
+{
+  // 代表配对:所选首牌同时是多条可执行配对的首牌时,reason.match 记哪一条
+  //   (2026-11-25 实现时定的规则:到配对完成拿牌数最少者;并列取元素名小者)
+  //   seed 1000 开局:首牌 69 是 4 条可执行 dig 的首牌,pairPicks 分别为 7 / 4 / 9 / 4;
+  //   69 的效能 0.9266(推进 13 个元素)是该局所有首牌里最大的 → dig 选它
+  //   最少 4 拿的有 u13、u7 两条 → 代表取 u13 pair[63,65](数值经探针核实)
+  const els14 = Array.from({ length: 14 }, (_, i) => ({ elementId: 'u' + (i + 1), displayName: '', color: '#fff' }));
+  const ctx = buildCtx(new Board(buildFilledLevel(LAYOUT.board, LAYOUT.tiles,
+    { elements: els14, seed: 1000 })));
+  const headed = ctx.analysis.matches.opportunities.filter(o =>
+    (o.type === 'hold' || o.type === 'dig') && o.executable === true && o.cost.picks[0] === 69);
+  const s = selectDig(ctx);
+  check('前置:开局首牌 69 是 4 条可执行 dig 的首牌,pairPicks 7 / 4 / 9 / 4',
+    headed.length === 4 && headed.map(o => o.cost.pairPicks).sort((a, b) => a - b).join(',') === '4,4,7,9',
+    headed.map(o => `${o.elementId}:${o.cost.pairPicks}`).join(' '));
+  check('代表配对:同一首牌的多条配对里取「到配对完成拿牌数最少」的一条;并列取元素名小者(u13 pair[63,65])',
+    s.match !== null && s.match.cost.picks[0] === 69
+    && s.match.elementId === 'u13' && JSON.stringify(s.match.pairId) === '[63,65]'
+    && s.match.cost.pairPicks === 4 && Math.abs(s.advance.total - 0.9295) < 1e-3,
+    `match=${s.match && `${s.match.elementId}[${s.match.pairId}] pp${s.match.cost.pairPicks}`} total=${s.advance && s.advance.total}`);
+}
+
+console.log('— 推进效能 advanceOf:拿一张牌推进了哪些挖掘路线(2026-11-25 设计者设计)—');
+// value = 1 / (拿后 pairPicks + 拿前滞留 × k) × (拿前可执行 ? 1 : 0.1),k = 1;
+// 相关配对 = picks 含所拿牌的 hold / dig;按元素取最优、跨元素求和;拿后配对消失(直接可配)不计。
+// 各盘数值均先经探针核实(temp/ 探针,未入库),再固化。
+{
+  // A 滞留:遮挡者无伴,自己带进槽出不去 → 1/(1+1) = 0.5
+  const b = new Board(level(24, 24, [['X', 16, 2, 0], ['X', 0, 2, 0], ['A', 0, 12, 1]]));
+  b.pick(0);
+  const a = advanceOf(2, buildCtx(b));
+  check('A 滞留 1:拿遮挡者 → 拿后还差 1 拿,价值 1/(1+1) = 0.5',
+    near(a.total, 0.5) && a.elements.length === 1 && a.elements[0].elementId === 'X'
+    && a.elements[0].pairPicks === 1 && a.elements[0].residual === 1 && a.elements[0].executable === true,
+    JSON.stringify(a));
+}
+{
+  // B 无滞留:遮挡者有可点伴,清槽阶段配掉 → 1/(1+0) = 1.0
+  const b = new Board(level(48, 24, [['X', 40, 2, 0], ['X', 0, 2, 0], ['A', 0, 12, 1], ['A', 32, 2, 0]]));
+  b.pick(0);
+  const a = advanceOf(2, buildCtx(b));
+  check('B 无滞留:价值 1/(1+0) = 1.0',
+    near(a.total, 1) && a.elements[0].residual === 0 && a.elements[0].pairPicks === 1,
+    JSON.stringify(a));
+}
+{
+  // C 不可执行 × 0.1 + 滞留计入约束:槽内已有 4 张(空槽 n=0)——遮挡者 A 虽会滞留
+  //   (residual 原始值仍记 1),但它的拿牌顺序 m=0 不满足 m<n → 不计入分母
+  //   → 1/(1+0) × 0.1 = 0.1(约束前为 1/(1+1) × 0.1 = 0.05)
+  const b = new Board(level(56, 24, [['X', 48, 2, 0], ['X', 0, 2, 0], ['A', 0, 12, 1],
+    ['U', 16, 2, 0], ['V', 24, 2, 0], ['W', 32, 2, 0]]));
+  b.pick(0); b.pick(3); b.pick(4); b.pick(5);
+  const ctx = buildCtx(b);
+  const a = advanceOf(2, ctx);
+  const hold = ctx.analysis.matches.opportunities.find(o => o.elementId === 'X');
+  check('C 滞留计入约束:空槽 0 → 滞留牌(拿牌顺序 0)不计入分母,效能 1/(1+0) × 0.1 = 0.1;residual 原始值仍为 1',
+    near(a.total, 0.1) && a.elements[0].executable === false && a.elements[0].residual === 1
+    && ctx.analysis.matches.emptySlots === 0
+    && JSON.stringify(hold.cost.residual) === '[2]'
+    && hold.cost.picks.indexOf(2) === 0,
+    JSON.stringify(a));
+}
+{
+  // C2 槽内遗留牌的同类抵消(2026-11-26 设计者指示):闭包里有槽内遗留牌的同类牌时,
+  //   挖开它能跟槽里那张配掉、腾回一格——有效滞留 −1(不减穿 0)
+  //   槽:U1(0)、X0(1);X2@(0,10,L0) 被 C3@(0,6,L1)(单独即可压住,无伴)与 U4@(-7,14,L1) 压住
+  //   → X:hold (1,2),region[3,4],picks[4,3,2],pairPicks 3,residual [3](C3 出不去;
+  //     U4 与槽内 U1 配掉,不滞留)。闭包里有槽内遗留牌 U1 的同类 U4 → offset 1
+  //   拿 C3:拿后差 2,有效滞留 1−1=0 → 1/2;无抵消则为 1/3
+  const b = new Board(level(64, 24, [
+    ['U', 24, 2, 0], ['X', 40, 2, 0], ['X', 0, 10, 0], ['C', 0, 6, 1], ['U', -7, 14, 1],
+  ]));
+  b.pick(0); b.pick(1);
+  const ctx = buildCtx(b);
+  const x = ctx.analysis.matches.opportunities.find(o => o.elementId === 'X');
+  const a = advanceOf(3, ctx);
+  check('C2 前置:X 的 hold 闭包 [3,4]、滞留 [3](C 无伴;U4 与槽内 U1 配掉不滞留)',
+    JSON.stringify(x.cost.region) === '[3,4]' && JSON.stringify(x.cost.residual) === '[3]'
+    && ctx.view.slot.map(s => s.elementId).join(',') === 'U,X',
+    `region=${x.cost.region} res=${x.cost.residual}`);
+  check('C2 同类抵消:闭包含槽内遗留牌 U1 的同类 U4 → offset 1,有效滞留 1−1=0,效能 1/2(无抵消为 1/3)',
+    near(a.total, 0.5) && a.elements.length === 1 && a.elements[0].residual === 1
+    && a.elements[0].offset === 1 && a.elements[0].pairPicks === 2 && a.elements[0].value === 0.5,
+    JSON.stringify(a));
+}
+{
+  // D 直接可配不计(记法乙):平盘 double 不在 hold / dig 里
+  const a = advanceOf(0, buildCtx(new Board(level(16, 24, [['E', 0, 2, 0], ['E', 8, 2, 0]]))));
+  check('D 直接可配(double):无相关 hold / dig,效能 0', a.total === 0 && a.elements.length === 0);
+}
+{
+  // D2 类型过滤:细条遮挡者在一条 double 的闭包里,但 close / double 不参与推进效能
+  //   E0(0)@(9,10,L0) 可点;X(1)@(2,2,L1) 只盖它 2.5%(闭包 {X},E0 仍可点);E2(2)@(18,10,L0) 可点
+  //   → E:double pair[0,2] region[1] pp2。拿 X(1):在闭包里、非配对牌,但类型不符 → 0
+  //   (若去掉类型过滤,会按 pp−1=1 记效能 1)
+  const ctx = buildCtx(new Board(level(48, 24, [['E', 9, 10, 0], ['X', 2, 2, 1], ['E', 18, 10, 0]])));
+  const d = ctx.analysis.matches.opportunities;
+  check('D2 类型过滤:double 的闭包里有细条 X(1),但 close / double 不计 → 拿 X 效能 0',
+    d.length === 1 && d[0].type === 'double' && JSON.stringify(d[0].pairId) === '[0,2]'
+    && JSON.stringify(d[0].cost.region) === '[1]' && advanceOf(1, ctx).total === 0,
+    `${d.map(o => `${o.type}${o.pairId}@${o.cost.region}`).join(' ')} | ${JSON.stringify(advanceOf(1, ctx))}`);
+}
+{
+  // D3 所拿的牌是 pairId[0] 且在闭包里:同样是配对牌,不计
+  //   同元素上牌 E0(0)@(0,2,L1) 盖住下牌 E1(1)@(0,10,L0) 上沿 2 行(20%:被压但可见)
+  //   → E1 不可点、闭包 {E0};E0 可点 → E:hold pair[0,1] region[0] pp2
+  //   拿 E0(1):它在闭包里,但它是这条配对的 pairId[0] → 0(若只排除 pairId[1] 会记 1)
+  const ctx = buildCtx(new Board(level(48, 24, [['E', 0, 2, 1], ['E', 0, 10, 0]])));
+  const d = ctx.analysis.matches.opportunities;
+  check('D3 配对牌是 pairId[0] 也不计:同元素上牌在自己的闭包里,拿它效能 0',
+    d.length === 1 && d[0].type === 'hold' && JSON.stringify(d[0].pairId) === '[0,1]'
+    && JSON.stringify(d[0].cost.region) === '[0]' && advanceOf(0, ctx).total === 0,
+    `${d.map(o => `${o.type}${o.pairId}@${o.cost.region}`).join(' ')} | ${JSON.stringify(advanceOf(0, ctx))}`);
+}
+{
+  // E 按元素归并:一张纯遮挡者同时推进同元素的两条路线,只记较优的一条
+  //   盘(按实际 tileId):x(0)'E' 可点;y(1)'E' 被 M(2) 压;z(3)'E' 被 N(4) 压;M'(5)'M'@L2 可点
+  //     E hold (0,1):region[2] picks[0,2,1,5]     差 3、滞留 0
+  //     E hold (0,3):region[4] picks[0,4,3]       差 3、滞留 1
+  //     E dig  (1,3):region[2,4] picks[2,5,1,4,3] 差 5、滞留 1
+  //   拿 M(2):它在 (0,1) 与 (1,3) 的闭包里、且不是配对牌 → 两条都相关:
+  //     (0,1):差 3 → 2,滞留 0 → 1/2;(1,3):差 5 → 4,滞留 1 → 1/5
+  //     归并只记较优的 1/2;逐条累加是 7/10;取最差是 1/5——三种实现在此可区分
+  //   (0,3) 的闭包是 [4],不含 2 → 不相关
+  const ctx = buildCtx(new Board(level(80, 24, [['E', 0, 2, 0], ['E', 24, 2, 0], ['M', 24, 12, 1],
+    ['E', 48, 2, 0], ['N', 48, 12, 1], ['M', 40, 4, 2]])));
+  const rel = ctx.analysis.matches.opportunities.filter(o => o.cost.region.indexOf(2) >= 0
+    && o.type !== 'double');
+  const a = advanceOf(2, ctx);
+  check('E 前置:遮挡者 M(2) 在同元素两条 E 路线的闭包里,且不是它们的配对牌',
+    rel.length === 2 && rel.every(o => o.elementId === 'E')
+    && rel.map(o => `${o.type} ${o.pairId.join(':')} @${o.cost.region.join(',')} pp${o.cost.pairPicks}`).join(' | ')
+      === 'hold 0:1 @2 pp3 | dig 1:3 @2,4 pp5',
+    rel.map(o => `${o.type} ${o.pairId.join(':')} @${o.cost.region.join(',')} pp${o.cost.pairPicks}`).join(' | '));
+  check('E 按元素归并:只记较优的一条(1/2)——既非逐条累加(7/10),也非取最差(1/5)',
+    near(a.total, 0.5) && a.elements.length === 1 && JSON.stringify(a.elements[0].pairId) === '[0,1]'
+    && a.elements[0].residual === 0 && a.elements[0].pairPicks === 2,
+    `${a.total} ${JSON.stringify(a.elements)}`);
+  check('E 拿配对牌不计:启动牌 x(0) 是两条 hold 的配对牌 → 效能 0(旧口径曾记 1/3)',
+    advanceOf(0, ctx).total === 0);
+  check('E 不在任何闭包里的牌不计:M\'(5) 出现在 3 条配对的 picks 里,但不在任何闭包里 → 效能 0',
+    ctx.analysis.matches.opportunities.filter(o => o.cost.picks.indexOf(5) >= 0).length === 3
+    && ctx.analysis.matches.opportunities.every(o => o.cost.region.indexOf(5) < 0)
+    && advanceOf(5, ctx).total === 0);
+}
+{
+  // F 跨元素求和:骑缝牌 M(4) 同时压着 E 伴与 F 伴的上沿 → 两条路线各 1/3,合计 2/3
+  const ctx = buildCtx(new Board(level(64, 24, [['E', 0, 2, 0], ['E', 16, 2, 0], ['F', 40, 2, 0], ['F', 24, 2, 0], ['M', 20, 12, 1]])));
+  const a = advanceOf(4, ctx);
+  check('F 跨元素求和:E 与 F 各 1/3(拿后差 2 拿、滞留 1),合计 2/3',
+    near(a.total, 2 / 3) && a.elements.map(e => e.elementId).join(',') === 'E,F',
+    `${a.total} ${JSON.stringify(a.elements)}`);
+}
+{
+  // F2 角色互换不丢配对(身份 = pairId,与 launcher / target 无关):
+  //   E 两张都被压。a(0) 闭包 {P(2), M(4)} = 2 → 成本 3;b(1) 闭包 {Q(3)} = 1 → 成本 2
+  //   拿前 dig:L1(成本低)/ T0。拿 M(4):a 闭包降到 1,与 b 打平 → 平分取 tileId 小者
+  //   → 拿后 dig:L0 / T1(角色互换,pairId [0,1] 不变)
+  //   峰值 5 > 空槽 4 → 不可执行 × 0.1;拿后差 4 拿、自己带入的滞留 3 → 1/(4+3) × 0.1
+  const ctx = buildCtx(new Board(level(48, 24, [['E', 0, 2, 0], ['E', 16, 2, 0], ['P', 0, 12, 1], ['Q', 16, 12, 1], ['M', -6, 2, 1]])));
+  const before = ctx.analysis.matches.opportunities.find(o => o.pairId.join(':') === '0:1');
+  const after = simulateAnalysisAfterPick(4, ctx).matches.opportunities.find(o => o.pairId.join(':') === '0:1');
+  check('F2 前置:拿 M 使两张配对牌获取成本打平 → 角色互换(L1/T0 → L0/T1),pairId 不变',
+    before.launcher.tileId === 1 && before.target.tileId === 0
+    && after.launcher.tileId === 0 && after.target.tileId === 1
+    && JSON.stringify(before.pairId) === JSON.stringify(after.pairId),
+    `前 L${before.launcher.tileId}/T${before.target.tileId} 后 L${after.launcher.tileId}/T${after.target.tileId}`);
+  const a = advanceOf(4, ctx);
+  check('F2 按身份对齐:角色互换的配对仍被计入(1/(4+3) × 0.1);按有序组 (1,0) 查会漏掉',
+    near(a.total, 1 / 7 * 0.1) && a.elements.length === 1
+    && JSON.stringify(a.elements[0].pairId) === '[0,1]' && a.elements[0].executable === false,
+    `${a.total} ${JSON.stringify(a.elements)}`);
+}
+{
+  // G 纯函数:多次预演后原视图 / 报告 / Board 不变
+  const b = new Board(level(72, 24, [['E', 0, 2, 0], ['E', 24, 2, 0], ['P', 24, 12, 1], ['E', 48, 2, 0], ['Q', 48, 12, 1]]));
+  const ctx = buildCtx(b);
+  const snap = JSON.stringify(ctx.analysis.matches.opportunities.map(o => [o.pairId, o.matchCost, o.cost.picks]))
+    + JSON.stringify(b.allTiles().map(t => [t.tileId, t.status]));
+  for (const t of ctx.clickable) advanceOf(t.tileId, ctx);
+  check('G 纯函数:多次计算后报告与真实 Board 不变',
+    JSON.stringify(ctx.analysis.matches.opportunities.map(o => [o.pairId, o.matchCost, o.cost.picks]))
+      + JSON.stringify(b.allTiles().map(t => [t.tileId, t.status])) === snap);
+}
+{
+  // I 不做预演:效能只读当前报告(2026-11-26 设计者指示)。拿走一张牌让路线近了多少,
+  //   由配对自己的执行计划直接读出——推进后 pairPicks = 拿前 − 1
+  //   盘:槽 sX(0);b(1)'X' 被 a(2) 压。hold (0,1):picks [2,1],到配对完成差 2 拿
+  const b = new Board(level(24, 24, [['X', 16, 2, 0], ['X', 0, 2, 0], ['A', 0, 12, 1]]));
+  b.pick(0);
+  const ctx = buildCtx(b);
+  const before = JSON.stringify(ctx.analysis.matches.opportunities.map(o => [o.pairId, o.cost.pairPicks]));
+  const a = advanceOf(2, ctx);
+  check('I 直接计算:拿 a(2) 推进 (0,1),差 2 → 1;遮挡者无伴滞留 1 → 1/(1+1) = 0.5',
+    near(a.total, 0.5) && a.elements[0].pairPicks === 1 && a.elements[0].pairId.join(',') === '0,1',
+    JSON.stringify(a));
+  // 若内部做了预演,会多调一次 analyze;用报告对象的同一性佐证「只读、不重算」
+  check('I 直接计算:当前报告对象未被替换,数值不变',
+    JSON.stringify(ctx.analysis.matches.opportunities.map(o => [o.pairId, o.cost.pairPicks])) === before);
+}
+{
+  // J 只在清槽段、不在闭包里的牌不计:它不是这条路线要清掉的遮挡者
+  //   盘:pB(4)'P' 不压牌;pA(5)'P' 压 r(6)'R';r'(7) 可点
+  //   R:hold pair[6,7] region[5] picks[7,5,6,4],pairPicks 3
+  //     闭包只有 [5](只有 5 压着 R 的牌);picks 末尾的 4 是配对完成后的清槽动作
+  //   拿 5:在闭包里 → R 差 3 → 2 → 1/2;拿 4:不在闭包里 → 不相关,效能 0
+  const ctx = buildCtx(new Board(level(56, 22, [
+    ['X', 0, 2, 0], ['X', 8, 2, 0], ['Q', 16, 2, 0], ['Q', 24, 2, 0],
+    ['P', 32, 2, 0], ['P', 40, 10, 1], ['R', 40, 2, 0], ['R', 48, 2, 0],
+  ])));
+  const r = ctx.analysis.matches.opportunities.find(o => o.elementId === 'R');
+  check('J 前置:R 的闭包 [5]、picks [7,5,6,4]——4 在 picks 里但不在闭包里',
+    JSON.stringify(r.cost.region) === '[5]' && JSON.stringify(r.cost.picks) === '[7,5,6,4]'
+    && r.cost.picks.indexOf(4) >= 0 && r.cost.region.indexOf(4) < 0);
+  check('J 不在闭包里的牌不计:拿 4 效能 0;拿 5(闭包内的遮挡者)→ 1/2',
+    advanceOf(4, ctx).total === 0 && near(advanceOf(5, ctx).total, 1 / 2),
+    `拿4=${JSON.stringify(advanceOf(4, ctx))} 拿5=${JSON.stringify(advanceOf(5, ctx))}`);
+}
+{
+  // K 拿配对牌不计:所拿的牌若是某条配对的配对牌,那条配对不相关
+  //   盘(按实际 tileId):E0(0) 在槽;E_b(1) 被 O(2) 压;E_a(3)@L1 压 R_a(4);R_b(5) 可点
+  //     E hold (0,1) region[2];E hold (1,3) region[2];R hold (4,5) region[3]
+  //   拿 3(E_a):3 是 E 两条 hold 的配对牌 → 不计;它在 R 的闭包里且不是 R 的配对牌 → 计入,
+  //     R 差 3 → 2,滞留 0 → 1/2
+  //   拿 2(O):普通遮挡者,在 E 两条 hold 的闭包里 → 取较优的 (0,1),差 2 → 1,滞留 1 → 1/2
+  //   拿 5(R_b):它是 R 配对的配对牌(可点的启动牌)→ 效能 0
+  const b = new Board(level(64, 24, [
+    ['E', 0, 2, 0], ['E', 16, 2, 0], ['O', 16, 12, 1], ['E', 32, 12, 1], ['R', 32, 2, 0], ['R', 40, 2, 0],
+  ]));
+  b.pick(0);
+  const ctx = buildCtx(b);
+  const holdsOf = e => ctx.analysis.matches.opportunities.filter(o => o.elementId === e && o.type === 'hold')
+    .map(o => `${o.pairId.join(':')}@${o.cost.region.join(',')}`).join(' ');
+  check('K 前置:槽内有 E(0);E 两条 hold (0,1)(1,3),闭包都是 [2];R 一条 hold (4,5),闭包 [3]',
+    ctx.view.slot.length === 1 && ctx.view.slot[0].elementId === 'E'
+    && holdsOf('E') === '0:1@2 1:3@2' && holdsOf('R') === '4:5@3',
+    `E:${holdsOf('E')} R:${holdsOf('R')}`);
+  const a3 = advanceOf(3, ctx);
+  check('K 拿配对牌不计:拿 3 是 E 两条 hold 的配对牌 → E 不计;它是 R 的纯遮挡者 → 只计 R,效能 1/2',
+    near(a3.total, 0.5) && a3.elements.length === 1 && a3.elements[0].elementId === 'R'
+    && a3.elements[0].pairId.join(',') === '4,5' && a3.elements[0].pairPicks === 2,
+    JSON.stringify(a3));
+  const a2 = advanceOf(2, ctx);
+  check('K 纯遮挡者:拿 2 在 E 两条 hold 的闭包里且不是配对牌 → 按元素归并取较优的 (0,1),效能 1/2',
+    near(a2.total, 0.5) && a2.elements.length === 1 && a2.elements[0].elementId === 'E'
+    && a2.elements[0].pairId.join(',') === '0,1' && a2.elements[0].pairPicks === 1,
+    JSON.stringify(a2));
+  check('K 拿启动牌不计:R_b(5) 是 R 配对的可点启动牌 → 效能 0',
+    advanceOf(5, ctx).total === 0, JSON.stringify(advanceOf(5, ctx)));
+}
+{
+  // H 性质(小批量:14 元素 3 盘):每张可点牌的效能 = 按口径**独立重算**的结果
+  //   口径(2026-11-26:不做预演,只读当前报告):
+  //     相关配对 = 报告里闭包 region 含所拿牌、且所拿牌不是配对牌的 hold / dig
+  //     计入滞留 = 拿牌顺序下标 < 当前空槽数的滞留牌(空槽耗尽后才拿的不计)
+  //     有效滞留 = 计入滞留 − 槽内遗留牌同类抵消(闭包里有其同类牌的槽内遗留牌,每张 −1,
+  //                不减穿 0;配对牌自己在槽内的那张是启动牌,不算遗留)
+  //     价值 = 1 / (拿前 pairPicks − 1 + 有效滞留) × (可执行 ? 1 : 0.1);pairPicks − 1 ≤ 0 的不计
+  //     按元素取价值最大的一条(平分取 pairId 字典序小者),跨元素求和
+  //   并核对两条口径事实:闭包 ⊂ picks;闭包内的牌不会只落在清槽段
+  const els = Array.from({ length: 14 }, (_, i) => ({ elementId: 'u' + (i + 1), displayName: '', color: '#fff' }));
+  const bad = [];
+  let checked = 0, nonzero = 0, inRegion = 0, asPairTile = 0, asBlocker = 0, offsetTotal = 0;
+  let residualActiveTotal = 0, residualLateTotal = 0;
+  const key = o => o.pairId.join(':');
+  for (let g = 0; g < 3; g++) {
+    const board = new Board(buildFilledLevel(LAYOUT.board, LAYOUT.tiles, { elements: els, seed: 1000 + g }));
+    for (let guard = 0; guard < 60; guard++) {
+      const ctx = buildCtx(board);
+      if (ctx.clickable.length === 0 || board.isCleared()) break;
+      const elemOf = new Map();
+      for (const t of ctx.view.perceived) elemOf.set(t.tileId, t.elementId);
+      for (const s of ctx.view.slot) elemOf.set(s.tileId, s.elementId);
+      for (const c of ctx.clickable) {
+        const a = advanceOf(c.tileId, ctx);
+        checked++;
+        if (a.total > 0) nonzero++;
+        // ── 独立重算 ──
+        const best = new Map();
+        for (const m of ctx.analysis.matches.opportunities) {
+          if (!(m.type === 'hold' || m.type === 'dig') || m.cost.region.indexOf(c.tileId) < 0) continue;
+          inRegion++;
+          if (m.cost.picks.indexOf(c.tileId) < 0) bad.push(`tileId ${c.tileId} 在 ${key(m)} 的闭包里却不在 picks 里`);
+          if (m.pairId[0] === c.tileId || m.pairId[1] === c.tileId) { asPairTile++; continue; }
+          if (m.cost.picks.indexOf(c.tileId) >= m.cost.pairPicks) bad.push(`tileId ${c.tileId} 是 ${key(m)} 的纯遮挡者却只落在清槽段`);
+          asBlocker++;
+          const after = m.cost.pairPicks - 1;
+          if (after <= 0) continue;
+          const residual = m.cost.residual.length;
+          const residualActive = m.cost.residual.filter(id => {
+            const order = m.cost.picks.indexOf(id);
+            return order >= 0 && order < ctx.analysis.matches.emptySlots;
+          }).length;
+          residualActiveTotal += residualActive;
+          residualLateTotal += residual - residualActive;
+          const regionElems = new Set();
+          for (const id of m.cost.region) {
+            const e = elemOf.get(id);
+            if (e !== undefined && e !== '?') regionElems.add(e);
+          }
+          let offset = 0;
+          for (const s of ctx.view.slot) {
+            if (s.elementId === '?') continue;
+            if (s.tileId === m.pairId[0] || s.tileId === m.pairId[1]) continue;
+            if (regionElems.has(s.elementId)) offset++;
+          }
+          offsetTotal += offset;
+          const value = 1 / (after + Math.max(0, residualActive - offset)) * (m.executable ? 1 : 0.1);
+          const cur = best.get(m.elementId);
+          if (!cur || value > cur.value || (value === cur.value && key(m) < cur.key)) {
+            best.set(m.elementId, { key: key(m), value, pairPicks: after, residual, offset, executable: !!m.executable });
+          }
+        }
+        const ref = [...best.entries()].sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))
+          .map(([elementId, e]) => ({ elementId, pairId: e.key.split(':').map(Number), pairPicks: e.pairPicks, residual: e.residual, offset: e.offset, executable: e.executable, value: e.value }));
+        if (JSON.stringify(a.elements) !== JSON.stringify(ref)) {
+          bad.push(`tileId ${c.tileId}:实现 ${JSON.stringify(a.elements)} ≠ 重算 ${JSON.stringify(ref)}`);
+        }
+        if (Math.abs(a.total - ref.reduce((s, e) => s + e.value, 0)) > 1e-12) bad.push(`tileId ${c.tileId}:total ≠ Σ`);
+        const ids = a.elements.map(e => e.elementId);
+        if (new Set(ids).size !== ids.length) bad.push(`元素重复:${ids}`);
+      }
+      const step = decideByLadder(defaultLadder, ctx);
+      const pick = board.pick(step.action.tileId);
+      if (!pick.ok) break;
+      if (pick.paired) { board.eliminate(pick.paired[0], pick.paired[1]); board.compactSlots(); }
+      if (board.isSlotFull() && !board.findSlotPair()) break;
+    }
+  }
+  check(`性质:3 盘 ${checked} 张次候选,与独立重算逐字段一致(其中 ${nonzero} 张次有效能;闭包内 ${inRegion} 次:配对牌 ${asPairTile} 次不计、纯遮挡者 ${asBlocker} 次;同类抵消共 ${offsetTotal} 次;计入滞留 ${residualActiveTotal} 张、窗口外 ${residualLateTotal} 张)`,
+    checked >= 200 && nonzero > 0 && asPairTile > 0 && asBlocker > 0 && offsetTotal > 0
+    && residualActiveTotal > 0 && residualLateTotal > 0 && bad.length === 0, bad.slice(0, 2).join('\n       '));
+}
+
+console.log('— dig 排序的键序(可执行 → 遗留 → 首牌差分 → 首牌 tileId → elementId → 启动牌 → 目标牌)—');
+// 手造最小对象直接钉 compareDigMatch 的键序:「遗留并列、消耗分先后、便宜的一方差分更大」
+// 之类的局面难以在合成盘上摆出,排序键序以单元断言钉死。
+{
+  const m = (elementId, residual, matchCost, o = {}) => ({
+    elementId, type: 'hold', matchCost, executable: o.exec !== false,
+    cost: { residual: new Array(residual).fill(0), picks: [o.first ?? 1] },
+    launcher: { tileId: o.launcher ?? 1 }, target: { tileId: o.target ?? 2 },
+    d: o.d,
+  });
+  const first = (a, b) => (compareDigMatch(a, b, x => x.d) < 0 ? a : b).elementId;
+  const D = (n, u, p) => ({ newExecutable: n, upgrades: u, peakDrop: p, detail: null });
+  check('第 1 级:可执行先于不可执行(遗留与差分不论)',
+    first(m('P', 0, 2, { exec: false }), m('Q', 3, 9, { d: D(0, 0, 0) })) === 'Q'
+    && first(m('Q', 3, 9, { d: D(0, 0, 0) }), m('P', 0, 2, { exec: false })) === 'Q');
+  check('第 2 级:遗留最少(差分不论)',
+    first(m('P', 1, 9, { d: D(0, 0, 0) }), m('Q', 2, 2, { d: D(9, 9, 999) })) === 'P');
+  check('第 3 级:同遗留比首牌差分(新增可执行 > 升级 > 峰值降);差分与首牌 tileId 指向不同候选时差分优先',
+    first(m('P', 1, 2, { d: D(0, 1, 0), first: 5 }), m('Q', 1, 2, { d: D(0, 0, 99), first: 3 })) === 'P'
+    && first(m('P', 1, 2, { d: D(0, 0, 99), first: 3 }), m('Q', 1, 2, { d: D(0, 1, 0), first: 5 })) === 'Q');
+  check('决胜:差分并列 → 首牌 tileId 小者;再并列 → elementId / 启动牌 / 目标牌',
+    first(m('P', 1, 2, { d: D(1, 0, 0), first: 5 }), m('Q', 1, 2, { d: D(1, 0, 0), first: 3 })) === 'Q'
+    && first(m('P', 1, 2, { d: D(1, 0, 0), first: 3, launcher: 4 }), m('P', 1, 2, { d: D(1, 0, 0), first: 3, launcher: 2 })) === 'P'
+    && first(m('P', 1, 2, { d: D(1, 0, 0), first: 3, target: 9 }), m('P', 1, 2, { d: D(1, 0, 0), first: 3, target: 4 })) === 'P');
 }
 
 console.log('— explore 梯:寻找新的潜在可能性(揭露量 > 自身风险)—');
@@ -528,9 +1097,9 @@ console.log('— explore 梯:寻找新的潜在可能性(揭露量 > 自身风�
   const bA = new Board(level(64, 24, [['X', 40, 2, 0], ['Q', 48, 2, 0], ['R', 56, 2, 0], ['X', 0, 2, 0], ['M', 0, 10, 1], ['U', 16, 2, 0]]));
   bA.pick(0); bA.pick(1); bA.pick(2);
   const cA = buildCtx(bA);
-  check('A 前置:空槽 1,X 为 hold 峰值 2 不可执行;前三梯均让位',
+  check('A 前置:空槽 1,X 为 hold、验算后峰值 2 不可执行;前三梯均让位',
     cA.analysis.matches.emptySlots === 1 && cA.analysis.matches.opportunities[0].type === 'hold'
-      && !cA.analysis.matches.opportunities[0].executable
+      && cA.analysis.matches.opportunities[0].executable === false
       && slotCloseRung.decide(cA) === null && pairCompleteRung.decide(cA) === null && digRung.decide(cA) === null);
   const opA = exploreRung.decide(cA);
   check('A 揭露量优先:取揭出 closes 的 m(揭露 1.0),不取平牌 u(揭露 0)',
@@ -592,57 +1161,60 @@ console.log('— explore 梯:寻找新的潜在可能性(揭露量 > 自身风�
     defaultLadder[defaultLadder.length - 1] === exploreRung && !defaultLadder.includes(wanderRung));
 }
 
-console.log('— 拾取差分择优:同一匹配的两张牌差分不同(两张牌各预演一次)—');
-// 注:本段原有一个盘面(三张 R 被一张 P 骑缝压;另有一张可点的 P 与槽内 S1/S2),
-//   用于验证「手里握着闭包内某牌的伴,会降低那次挖掘的峰值 → 拿它使匹配变得可执行」。
-//   2026-11-25 消除模拟改为两组贪心取最小(dig-only / settle-first)后,R 在拿那张 P
-//   之前峰值即为 2、本就可执行,该盘面的前提不再成立,三条断言随之移除。
-//   该机制本身未变:原有槽内牌与闭包内的牌仍可配对(见 agent-perception 的来源规则测试)。
+console.log('— 推进效能择优:三个择优梯各自负责的牌上比效能(2026-11-25 设计者设计)—');
+// 取代此前的「拾取差分择优」。数值均先经探针核实(temp/ 探针,未入库),再固化。
 {
-  // 择优不受 tileId 牵制:同一匹配里揭出升级的那张胜出,即便 tileId 更大
-  //   pB(4)'P'@(32,2,L0) 不压任何牌;pA(5)'P'@(40,10,L1) 压 r(6)'R'@(40,2,L0)(32)
-  //   r'(7)'R'@(48,2,L0) 可点 → R 为 hold 型(launcher r' / target r,峰值 3)
-  //   另有平的双亮对 X(0,1)、Q(2,3)
-  //   拿 pA(5) → r 变可点,R: hold→double(升级 2);拿 pB(4) → 无升级(升级 1)
+  // pair-complete:候选 = 可执行 double 里的牌。P 的两张 pB(4)、pA(5) 拿哪张都能成对,
+  //   但 pA 压着 R 的伴 r(6)——拿 pA 顺带推进 R 的 hold 路线
+  //   pB(4)'P'@(32,2,L0) 不压任何牌;pA(5)'P'@(40,10,L1) 压 r(6)'R'@(40,2,L0);r'(7) 可点
+  //   R:hold picks[7,5,6,4],到配对完成差 3 拿(前 3 拿 7、5、6)、无滞留;
+  //     第 4 拿的 4 是配对完成**之后**的清槽动作(把带入的 P 牌 4 拿进来与 5 配掉)
+  //     拿 5:R 差 3 → 2 → 1/2 = 0.5
+  //     拿 4:4 在 picks 里但位于 pairPicks 之后(清槽尾巴),对「到配对完成」没有贡献 → 不计,效能 0
+  //     X、Q 的 double 牌不在任何 hold / dig 路径上 → 0
   const ctx = buildCtx(new Board(level(56, 22, [
     ['X', 0, 2, 0], ['X', 8, 2, 0], ['Q', 16, 2, 0], ['Q', 24, 2, 0],
     ['P', 32, 2, 0], ['P', 40, 10, 1], ['R', 40, 2, 0], ['R', 48, 2, 0],
   ])));
   const op = decideByLadder([pairCompleteRung], ctx);
-  check('两张牌各预演一次:取揭出升级的 pA(5),tileId 更大也胜出;次优 = 同匹配的另一张 pB(4)',
-    op.action.tileId === 5 && op.reason.delta.upgrades === 2
-      && op.reason.delta.detail.upgraded.join(',') === 'P:double→close,R:hold→double'
-      && op.reason.runnerUp && op.reason.runnerUp.tileId === 4
-      && op.reason.utility > op.reason.runnerUp.score,
-    `pick=${op.action.tileId} delta=${JSON.stringify(op.reason.delta)} ru=${JSON.stringify(op.reason.runnerUp)}`);
+  check('pair-complete:同匹配的两张牌比效能——拿 pA(5) 把 R 的路线从差 3 推进到差 2(0.5);tileId 更大也胜出',
+    op.action.tileId === 5 && near(op.reason.utility, 0.5)
+    && op.reason.advance.elements.length === 1 && op.reason.advance.elements[0].elementId === 'R'
+    && op.reason.advance.elements[0].pairPicks === 2 && op.reason.advance.elements[0].residual === 0
+    && op.reason.runnerUp !== undefined && op.reason.runnerUp.tileId < 5 && op.reason.runnerUp.score === 0,
+    `pick=${op.action.tileId} advance=${JSON.stringify(op.reason.advance)} ru=${JSON.stringify(op.reason.runnerUp)}`);
+  check('清槽尾巴不计:4 在 R 的 picks 里,但位于第 pairPicks 拿之后 → 拿 4 不推进 R,效能 0(预演版曾误记 1/3)',
+    advanceOf(4, ctx).total === 0 && ctx.analysis.matches.opportunities
+      .filter(o => o.elementId === 'R').every(o => o.cost.picks.indexOf(4) >= o.cost.pairPicks),
+    `advanceOf(4)=${JSON.stringify(advanceOf(4, ctx))}`);
+  check('pair-complete:不在任何 hold / dig 路径上的候选效能为 0(X、Q 的四张 double 牌)',
+    [0, 1, 2, 3].every(id => advanceOf(id, ctx).total === 0));
+  check('pair-complete:拿哪张都能成对——所拿牌的可点伴(4)记入 note,消耗 2/4 格',
+    op.reason.note.includes('伴 4 可点') && op.reason.note.includes('消耗 2/4 格') && op.reason.note.includes('候选 6'),
+    `note="${op.reason.note}"`);
 }
 {
-  // slot-close 择优(拾取差分,2026-11-24):两个可闭对并存,其一顺带让另一匹配升级
-  //   cA(3)'A'@(0,12,L1) 压 x(4)'Z'@(0,2,L0)(x 暴露 80%,被压但在感知集);
-  //   cB(5)'B'@(16,24,L1) 不压任何牌
-  //   槽:sA(0)'A' sB(1)'B' sZ(2)'Z'(均 @(16..32, 2..22) L0,互不重叠)
-  //   拿 cA:x 变可点,而槽内有 sZ → 匹配 Z: hold→close(类型升级 +1);拿 cB:无升级
+  // slot-close:候选 = close 型的目标牌。两个可闭对并存,其一顺带推进另一条路线
+  //   cA(3)'A'@(0,12,L1) 压 x(4)'Z'@(0,2,L0);cB(5)'B'@(16,24,L1) 不压任何牌
+  //   槽:sA(0)'A' sB(1)'B' sZ(2)'Z'
+  //   Z:hold picks[3,4],到配对完成差 2 拿、无滞留。拿 cA(3):Z 拿后差 1 → 效能 1.0;拿 cB(5):0
   const b = new Board(level(32, 36, [
     ['A', 16, 2, 0], ['B', 24, 2, 0], ['Z', 16, 12, 0], ['A', 0, 12, 1], ['Z', 0, 2, 0], ['B', 16, 24, 1],
   ]));
   b.pick(0); b.pick(1); b.pick(2);
   const ctx = buildCtx(b);
   const op = decideByLadder([slotCloseRung], ctx);
-  check('slot-close 择优:带出类型升级的候选胜(拿 cA → Z: hold→close;次优 cB 无升级)',
-    op.action.tileId === 3 && op.reason.delta !== undefined
-      && op.reason.delta.newExecutable === 0 && op.reason.delta.upgrades === 1
-      && op.reason.delta.detail.upgraded.join(',') === 'Z:hold→close'
-      && op.reason.runnerUp && op.reason.runnerUp.tileId === 5
-      && op.reason.utility > op.reason.runnerUp.score,
-    `pick=${op.action.tileId} delta=${JSON.stringify(op.reason.delta)} ru=${JSON.stringify(op.reason.runnerUp)}`);
+  check('slot-close 择优:顺带推进另一条路线的候选胜(拿 cA → Z 的 hold 从差 2 到差 1,效能 1.0;次优 cB 为 0)',
+    op.action.tileId === 3 && op.reason.utility === 1
+    && op.reason.advance.elements.length === 1 && op.reason.advance.elements[0].elementId === 'Z'
+    && op.reason.advance.elements[0].pairPicks === 1
+    && op.reason.runnerUp && op.reason.runnerUp.tileId === 5 && op.reason.runnerUp.score === 0
+    && op.reason.utility > op.reason.runnerUp.score,
+    `pick=${op.action.tileId} advance=${JSON.stringify(op.reason.advance)} ru=${JSON.stringify(op.reason.runnerUp)}`);
   check('该操作预期:闭对(slotAfter 3−1 = 2)且 forecast 预演揭出的 x 为 closes',
     op.expectation.pairCompletes && op.expectation.slotAfter === 2
     && op.expectation.exposes.length === 1 && op.expectation.exposes[0] === 4
     && op.expectation.forecast.clickable[0].activation === 'closes');
-  check('差分明细:拿 cA 使 A:close 消失(自身闭对离场);Z 拾取前已可执行故不计「新增」',
-    op.reason.delta.detail.disappeared.join(',') === 'A:close'
-      && op.reason.delta.detail.newExecIds.length === 0,
-    `detail=${JSON.stringify(op.reason.delta.detail)}`);
   // 合并后的资源余量:拾取前空槽 1,预演闭对后为 2——可执行性按合并后的余量判定
   {
     const ctxX = buildCtx(b);
@@ -652,6 +1224,7 @@ console.log('— 拾取差分择优:同一匹配的两张牌差分不同(两张�
         && sim.matches.opportunities.every(o => o.executable));
   }
 }
+
 console.log('— pair-complete(拾取差分):候选来源 / 可执行门槛 / 匹配身份与角色无关 —');
 {
   // 候选来源 = MatchReport 中可执行的 double 型匹配;每个匹配两张牌各预演一次
@@ -661,18 +1234,15 @@ console.log('— pair-complete(拾取差分):候选来源 / 可执行门槛 / �
   check('候选来源:平盘 4 个可执行 double(峰值均为 2 / 空槽 4)',
     doubles.length === 4 && doubles.every(o => o.matchCost === 2)
     && ctx.analysis.matches.emptySlots === 4);
-  check('pair-complete 出手并携带差分;reason 注明消耗 2/4 格;所拿的牌属于某个 double',
-    op !== null && op.reason.rule === 'pair-complete' && op.reason.delta !== undefined
+  check('pair-complete 出手并携带推进效能;reason 注明消耗 2/4 格;所拿的牌属于某个 double',
+    op !== null && op.reason.rule === 'pair-complete' && op.reason.advance !== undefined
       && op.reason.note.includes('消耗 2/4 格')
       && doubles.some(o => o.launcher.tileId === op.action.tileId || o.target.tileId === op.action.tileId),
     `note="${op && op.reason.note}"`);
-  check('匹配身份与角色无关:同一对的两张牌差分完全相同(拿 0 与拿 1 均 0/1/1,E1: double→close)',
-    [0, 1].every(id => {
-      const d = pickDelta(id, ctx);
-      return d.newExecutable === 0 && d.upgrades === 1 && d.peakDrop === 1
-        && d.detail.upgraded.join(',') === 'E1:double→close'
-        && d.detail.appeared.length === 0 && d.detail.disappeared.length === 0;
-    }), `拿 0:${JSON.stringify(pickDelta(0, ctx).detail)} 拿 1:${JSON.stringify(pickDelta(1, ctx).detail)}`);
+  check('纯平盘没有 hold / dig:候选效能全为 0,按 tileId 决胜(拿 0),次优 1(0)',
+    op.action.tileId === 0 && op.reason.utility === 0 && op.reason.advance.elements.length === 0
+    && op.reason.runnerUp && op.reason.runnerUp.tileId === 1 && op.reason.runnerUp.score === 0,
+    `pick=${op.action.tileId} ru=${JSON.stringify(op.reason.runnerUp)}`);
 }
 {
   // 可执行门槛:double 的峰值为 2,空槽不足 2 时匹配不可执行 → 整梯让位
@@ -691,11 +1261,12 @@ console.log('— pair-complete(拾取差分):候选来源 / 可执行门槛 / �
   check('空槽 2:double 可执行 → pair-complete 出手', op2 !== null && op2.action.tileId === 0);
 }
 {
-  // 轨迹:defaultLadder 下 pair-complete 的操作携带差分落盘,utility = 差分标量
+  // 轨迹:defaultLadder 下 pair-complete / slot-close 的操作都携带推进效能落盘,
+  //   utility = 效能总量(启动梯已移除;平盘没有 hold / dig,效能全为 0)
   const r = runAgent(new Board(flatLevel()), { seed: 7, decision: ladderPolicy() });
-  const pc = r.steps.filter(s => s.operation.rule === 'pair-complete');
-  check('轨迹:pair-complete 各步携带 delta,utility = deltaScore(delta)',
-    pc.length === 4 && pc.every(s => s.operation.delta && s.operation.utility === deltaScore(s.operation.delta)));
+  const picks = r.steps.filter(s => s.operation.rule === 'pair-complete' || s.operation.rule === 'slot-close');
+  check('轨迹:pair-complete 与 slot-close 各步都携带 advance,utility = 效能总量',
+    picks.length === 8 && picks.every(s => s.operation.advance && s.operation.utility === s.operation.advance.total));
 }
 // 平分确定性:对称盘 → tileId 小者。
 //   pair-complete 这条同时依赖「匹配身份与角色无关」:若按 (launcher, target) 记身份,
@@ -719,24 +1290,27 @@ console.log('— pair-complete(拾取差分):候选来源 / 可执行门槛 / �
         === JSON.stringify(s.operation.expectation.forecast.clickable.map(c => c.tileId))));
 }
 
-console.log('— MatchReport 配对保留扩展(2026-11-24):全部候选参与择优 / 按牌去重 / 差分按元素计 —');
+console.log('— MatchReport 配对保留扩展(2026-11-24):全部候选参与择优 / 按牌去重 / 按元素归并 —');
 {
-  // 择优不受候选假值影响:两个择优梯直接拿 tileId 当候选,数值 0 也是合法候选
-  //   X0(0,6,L1) 盖住 Y_a(0,10,L0) 上沿(可见、可识别,但被压);X1(8,10);Y_b(16,10)
-  //   拿 X0:Y 的配对 hold → double(升级 +1),外加 X 自己 double → close → 0/2/2
-  //   拿 X1:只有 X 自己的变化 → 0/1/2
+  // 择优不受候选假值影响:择优梯直接拿 tileId 当候选,数值 0 也是合法候选
+  //   X0(0,6,L1) 盖住 Y_a(2)@(0,10,L0) 上沿;X1(1)@(8,10);Y_b(3)@(16,10)
+  //   Y:hold picks[3,0,2,1](到配对完成差 3 拿、无滞留)——X 的两张牌都在这条路线里
+  //     Y:hold picks[3,0,2,1],到配对完成差 3 拿(前 3 拿 3、0、2);第 4 拿的 1 是清槽动作
+  //     拿 X0(0):0 在到配对完成的路径上,Y 差 3 → 2 → 1/2 = 0.5
+  //     拿 X1(1):1 在 picks 里但位于 pairPicks 之后(清槽尾巴)→ 不计,效能 0
   const ctx = buildCtx(new Board(level(40, 20, [
     ['X', 0, 6, 1], ['X', 8, 10, 0], ['Y', 0, 10, 0], ['Y', 16, 10, 0]])));
-  const d0 = pickDelta(0, ctx);
-  const d1 = pickDelta(1, ctx);
-  check('前置:拿 tileId 0 的差分严格优于拿 tileId 1(0/2/2 对 0/1/2)',
-    d0.newExecutable === 0 && d0.upgrades === 2 && d0.peakDrop === 2
-    && d1.newExecutable === 0 && d1.upgrades === 1 && d1.peakDrop === 2,
-    `拿0:${d0.newExecutable}/${d0.upgrades}/${d0.peakDrop} 拿1:${d1.newExecutable}/${d1.upgrades}/${d1.peakDrop}`);
+  const a0 = advanceOf(0, ctx);
+  const a1 = advanceOf(1, ctx);
+  check('前置:拿 tileId 0 的效能 0.5(推进 Y 的 hold 路线);拿 tileId 1 效能 0(清槽尾巴,不计)',
+    near(a0.total, 0.5) && a0.elements[0].elementId === 'Y' && a0.elements[0].pairPicks === 2
+    && a1.total === 0 && a1.elements.length === 0,
+    `拿0:${a0.total} 拿1:${a1.total}`);
   const op = pairCompleteRung.decide(ctx);
-  check('择优:候选是数值 tileId(含 0)时也能正常胜出(拿 0),次优 = 1',
+  check('择优:候选是数值 tileId(含 0)时也能正常胜出(拿 0),次优 = 1(效能 0)',
     op.action.tileId === 0 && op.reason.runnerUp !== undefined
-    && op.reason.runnerUp.tileId === 1 && op.reason.runnerUp.score === deltaScore(d1),
+    && op.reason.runnerUp.tileId === 1 && op.reason.runnerUp.score === 0
+    && op.reason.utility === a0.total,
     `拿 ${op.action.tileId} · 次优 ${op.reason.runnerUp?.tileId} · note="${op.reason.note}"`);
 }
 {
@@ -780,11 +1354,15 @@ console.log('— MatchReport 配对保留扩展(2026-11-24):全部候选参与�
     ['X', 0, 6, 1], ['Y', 0, 10, 0], ['Y', 16, 10, 0], ['Y', 24, 10, 0]])));
   const after = simulateAnalysisAfterPick(0, ctx);
   const d = pickDelta(0, ctx);
-  check('前置:拿 X0 后 Y 名下 3 条 double(原 1 条)',
-    (ctx.analysis.matches.byElement.get('Y') ?? []).length === 1
-    && (after.matches.byElement.get('Y') ?? []).length === 3
-    && (after.matches.byElement.get('Y') ?? []).every(o => o.type === 'double' && o.executable),
-    `前 ${(ctx.analysis.matches.byElement.get('Y') ?? []).length} 条 · 后 ${(after.matches.byElement.get('Y') ?? []).length} 条`);
+  const beforeY = ctx.analysis.matches.byElement.get('Y') ?? [];
+  const afterY = after.matches.byElement.get('Y') ?? [];
+  check('前置:全量清单下 Y 名下拿前 3 条(1 double + 2 hold,均已验算、可执行),拿后 3 条 double(可执行)',
+    beforeY.length === 3 && beforeY.filter(o => o.type === 'double').length === 1
+    && beforeY.filter(o => o.type === 'hold').length === 2
+    && beforeY.every(o => o.cost !== undefined && o.executable === true)
+    && afterY.length === 3 && afterY.every(o => o.type === 'double' && o.executable === true),
+    `前 ${beforeY.length} 条(double ${beforeY.filter(o => o.type === 'double').length})`
+      + ` · 后 ${afterY.length} 条`);
   check('按元素计:Y 原本就可执行、等级不变、最低消耗不变 → 差分 0/0/0(按配对会记成 2/2/0)',
     d.newExecutable === 0 && d.upgrades === 0 && d.peakDrop === 0
     && d.detail.appeared.length === 0 && d.detail.upgraded.length === 0,

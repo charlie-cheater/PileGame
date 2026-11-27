@@ -363,7 +363,9 @@ export interface MatchCostBreakdown {
   /** 逐步净占用序列(每次拿牌后的阶段 2 读数;峰值 = 其最大值)。
    *  首元素对应 launcher 入槽(若 launcher 已在槽内则不入槽,序列从挖 target 起) */
   occupancy: number[];
-  /** 模拟结束时槽内剩余的牌(出不去:伴被压或身份未知) */
+  /** 滞留牌:这条路线**自己带进槽**、模拟结束时仍出不去的牌(伴被压或身份未知)。
+   *  不含模拟开始时槽内原有的牌——那是既成事实(见 preexisting),与这条路线无关;
+   *  原有的牌若到结束时仍在槽里,也不会出现在这里(2026-11-25 设计者裁定) */
   residual: number[];
   /** 模拟的拿牌次数 */
   steps: number;
@@ -373,34 +375,56 @@ export interface MatchCostBreakdown {
   picks: number[];
   /** 胜出的拿牌策略(各策略跑一遍取峰值最小者;平分取靠前者) */
   strategy: SimStrategy;
+  /** 到配对完成为止的拿牌次数(2026-11-25 设计者指示):launcher 与 target 都离场时的
+   *  累计拿牌数,含完成配对的那一拿;配对完成后的清槽拿牌不计(与 steps 之差即清槽)。
+   *  close / double 恒为 1 / 2 */
+  pairPicks: number;
+  /** 外部资源使用计数(2026-11-27 设计者指示):达成配对的过程中使用了多少
+   *  闭包以外的牌——计划拿牌(picks)里不属于挖掘区(region)的张数,即清槽
+   *  与 settle 时为模拟带入牌找的「闭包外可点伴」。0 = 路线自洽(只动自己
+   *  挖掘区内的牌);越大 = 路线越依赖挖掘区外的资源 */
+  external: number;
 }
 
 export interface MatchOpportunity {
   elementId: string;
+  /** 配对的稳定身份:无序 tileId 对(tileId 升序)。launcher / target 是**派生角色**
+   *  (获取成本低者,平则 tileId 小者),不是身份——拾取后牌入槽成本变 0,同一对牌
+   *  会角色互换、类型升级(double → close),身份不变。逐 match 的差分与 ⑤对账
+   *  以此对齐;以 (launcher, target) 有序组当身份,角色互换会被算成「消失 + 新增」
+   *  而虚增(2026-11-24 曾因此失真,按元素计绕开;2026-11-25 报告阶段补身份字段) */
+  readonly pairId: readonly [number, number];
   /** 启动牌:配对两张中获取成本最低者(槽内牌成本 0,存在即恒为启动牌) */
   launcher: MatchTileRef;
   /** 目标牌:另一张(次低成本) */
   target: MatchTileRef;
+  /** 匹配类型(close / double / hold / dig;由两张牌能否直接拿到导出,分类不需要验算) */
+  type: MatchType;
   /** 匹配消耗 = 消除模拟的**净占用峰值**:完成这次配对,最多同时占几个新槽位。
    *  单位 = 槽位格数,可与空槽数直接比较(peak ≤ 空槽数 ⇔ 执行得下去)。
-   *  空槽视为无限(模拟不因槽满中断);无论当前资源是否足够均计算 */
-  matchCost: number;
-  /** 消耗分解(挖掘区 / 原有槽内牌 / 占用序列 / 剩余) */
-  cost: MatchCostBreakdown;
-  type: MatchType;
-  /** 当前空槽数是否不小于 matchCost(由模拟结果与资源直接比较得出) */
-  executable: boolean;
+   *  空槽视为无限(模拟不因槽满中断)。
+   *  **报告期只验算 close / double 型**(pair-complete 的可执行门槛与拾取差分的分量
+   *  要读它们);**hold / dig 型只分类不验算**——消耗与槽位占用等数据由 dig 梯按需
+   *  报告期即逐条验算(2026-11-25 设计者指示:对所有 hold / dig 配对组合模拟) */
+  matchCost?: number;
+  /** 消耗分解(挖掘区 / 原有槽内牌 / 占用序列 / 剩余)。hold / dig 型验算前为 undefined */
+  cost?: MatchCostBreakdown;
+  /** 当前空槽数是否不小于 matchCost(由模拟结果与资源直接比较得出)。
+   *  hold / dig 型验算前为 undefined */
+  executable?: boolean;
 }
 
 export interface MatchReport {
-  /** 保留的全部配对(2026-11-24 起每元素可有多条):按匹配消耗升序,
-   *  同消耗依次按 elementId / 启动牌 / 目标牌 */
+  /** 全部配对(2026-11-25 设计者定稿:**全量清单**——每个元素名下所有候选两两配对
+   *  都记录并分类;取代 2026-11-24 的「close / double 全留、需挖掘的每元素只留获取
+   *  成本最低的一条」)。排序:已验算的(close / double)在前按消耗升序,
+   *  未验算的(hold / dig)在后;同段内按 elementId / 启动牌 / 目标牌 */
   opportunities: MatchOpportunity[];
-  /** elementId → 该元素保留的配对(顺序同 opportunities) */
+  /** elementId → 该元素的全部配对(顺序同 opportunities) */
   byElement: Map<string, MatchOpportunity[]>;
   /** 当前空槽数 */
   emptySlots: number;
-  /** 各类型配对计数 */
+  /** 各类型配对计数(全量清单口径) */
   byType: { close: number; double: number; hold: number; dig: number };
 }
 
@@ -410,36 +434,25 @@ export interface MatchReport {
 const isTakeable = (c: MatchTileRef): boolean => c.inSlot || c.acquireCost === 1;
 
 /**
- * 匹配机会报告:同一元素的已识别候选牌(槽内 + pile)配对,每个保留的配对做一次
- * 消除模拟,matchCost = **净占用峰值**——完成这次配对,最多同时占几个新槽位。
- * 启动牌 = 获取成本低者(槽内牌成本 0,存在即恒为启动牌)。
+ * 匹配机会报告(2026-11-25 设计者定稿的报告职责):遍历感知集,把每个元素名下
+ * **全部**候选两两配对记录下来并做基本分类(close / double / hold / dig),
+ * 供③决策的各梯按类型取用(slot-close 收 close,pair-complete 收 double,dig 收
+ * hold / dig)。启动牌 = 获取成本低者(槽内牌成本 0,存在即恒为启动牌)。
  *
- * 保留哪些配对(2026-11-24 设计裁定;此前每元素只留获取成本最低的一对,使 slot-close /
- * pair-complete 漏掉了同样能闭对、同样可点的牌):
- *   · 两张都能直接拿到的配对(close / double 型)——全部保留
- *   · 需要挖掘的配对(hold / dig 型)——每个元素留获取成本最低的一对
- *   实测(四档各 500 局,同种子):展开前者使 14 / 23 元素档通关率 66.8% → 73.6%、
- *   5.6% → 7.4%,7 元素档槽压峰值 2.15 → 1.63;再多保留需挖掘的配对,通关率无可见
- *   变化,耗时 2~4 倍。
+ * 分类(由两张牌「能否直接拿到」导出;不看闭包大小——被不足阈值的细条盖住的牌
+ * 可点而闭包不为 0):槽内 + 可点 = close;两张可点 = double;
+ * 一张能拿到、另一张被压 = hold;两张都被压 = dig。
  *
- * 模拟规则:
- *   · 空槽视为无限:不因槽满中断,挖掘区内可合并的配对最终一定合并
- *   · 每步四阶段:① 牌入槽占位 → ② 统计占用(**峰值在此读取**)→
- *     ③ 检查匹配并消除 → ④ 重新统计占用。峰值取消除之前——牌刚进槽、
- *     尚未配对时占用最高,这才是真实需要的空槽数
- *   · 净占用 = 槽内总数 − 模拟开始时已有的槽内牌数。原有牌被用于配对时
- *     总数减 1,净占用随之下降(「−1 处理」由此自然得出:闭包仅 1 张、
- *     槽内已持伴时,额外占用 = 1)
- *   · 挖牌:对 launcher、target 依次执行「反复拿它当前可点的闭包成员,直到它可点,
- *     再拿它」。候选只取该牌自己的闭包——不顺手拿别的东西;优先拿能立即闭对的。
- *     launcher 已在槽内则跳过。两牌共享的前置只被拿一次
- *   · 清槽:对槽内出不去的牌,**只在槽内牌与当前可点牌中**找伴——不找被
- *     遮盖的(递归深度超出一般人类的感知范围)。伴被压或身份未知的牌
- *     留在 residual,不计入峰值
+ * 验算(2026-11-25 设计者指示:报告期对所有 hold / dig 类型的配对组合模拟):
+ *   **全部配对**报告期即验算(挖掘区 → 消除模拟 → 净占用峰值 → 可执行性),
+ *   matchCost / 滞留牌(cost.residual)/ executable 逐条可得;决策各梯直接读报告,
+ *   dig 梯不再有出手时验算的开销。历史分工(同日早前「close / double 报告期验算、
+ *   hold / dig 只分类,dig 出手按需验算」)撤销——拾取差分的「新增可执行 / 峰值
+ *   下降」分量随之恢复对全部类型的覆盖(「挖掘变便宜」重新可见)
  *
- * 取代的历史口径(均为对峰值的公式近似):v2.2 双口径平均、v3 闭包并集 −
- *   可合并项 + 待入槽张数、+1/+2 加项规则。共同路径只计一次(并集)、
- *   可合并项的消化、+1 还是 +2,现在是模拟的自然结果而非显式规则。
+ * 模拟规则(simulateMatch,详见该处):空槽视为无限;每步四阶段,峰值取消除之前;
+ * 净占用扣除模拟开始时已有的槽内牌;挖牌只拿各自闭包内的成员;清槽只找槽内或
+ * 当前可点的伴。共同路径只计一次、可合并项的消化、+1 还是 +2,都是模拟的自然结果。
  *
  * 候选规则的推论(穷举 57699 组几何核实):挖掘区内那张同元素牌压着某候选时,
  *   它必不比被压者贵,会被选为 target——「中间的那张被选为 target」是规则的正确行为。
@@ -460,79 +473,22 @@ function matchOpportunities(
 
   groups.groups.forEach(g => {
     // 候选:槽内(至多 1 张,成本 0)+ 已识别 pile 牌(成本 = flatCostOf)
-    const candidates: MatchTileRef[] = [];
-    if (g.slot.length > 0) {
-      candidates.push({ tileId: g.slot[0], acquireCost: 0, revealCount: 0, inSlot: true });
-    }
-    for (const r of g.pile) {
-      candidates.push({
-        tileId: r.tileId,
-        acquireCost: flatCostOf(r.tileId, analysis),
-        revealCount: analysis.closureSize.get(r.tileId) ?? 0,
-        inSlot: false,
-      });
-    }
+    const candidates = matchCandidatesOf(g, analysis);
     if (candidates.length < 2) return;   // 伴不可见/单张:当前信息下不成对
 
-    // ① 两张都能直接拿到的配对:全部保留
-    const pairs: Array<[MatchTileRef, MatchTileRef]> = [];
+    // 全部两两配对:逐条验算(挖掘区 → 消除模拟 → 峰值/滞留牌/可执行性)
     for (let i = 0; i < candidates.length; i++) {
       for (let j = i + 1; j < candidates.length; j++) {
-        if (isTakeable(candidates[i]) && isTakeable(candidates[j])) {
-          pairs.push([candidates[i], candidates[j]]);
-        }
+        opportunities.push(opportunityOf(view, analysis, closureOf, g.elementId, candidates[i], candidates[j]));
       }
-    }
-    // ② 需挖掘的那条:获取成本最低的一对(两张都能拿到时,它本身就是 ① 里的某个配对)
-    const byCost = candidates.slice().sort((a, b) => a.acquireCost - b.acquireCost || a.tileId - b.tileId);
-    const first = byCost[0];
-    const second = byCost[1];
-    const covered = pairs.some(([p, q]) => (p === first && q === second) || (p === second && q === first));
-    if (!covered) pairs.push([first, second]);
-
-    for (const [p, q] of pairs) {
-      // 启动牌 = 获取成本低者(平则 tileId 小者);目标牌 = 另一张
-      const launcher = p.acquireCost < q.acquireCost
-        || (p.acquireCost === q.acquireCost && p.tileId < q.tileId) ? p : q;
-      const target = launcher === p ? q : p;
-
-      // 挖掘区:两牌闭包并集(共同路径只计一次;tileId 升序)
-      const regionSet = new Set<number>();
-      for (const id of closureOf(launcher.tileId)) regionSet.add(id);
-      for (const id of closureOf(target.tileId)) regionSet.add(id);
-      const region = [...regionSet].sort((a, b) => a - b);
-
-      const sim = simulateMatch(view, launcher.tileId, target.tileId, region, closureOf,
-        analysis.occlusion, analysis.derived);
-
-      // 类型由两张牌能否直接拿到导出:槽内 + 可点 = close;两张可点 = double;
-      // 一张能拿到、另一张被压 = hold;两张都被压 = dig
-      const type: MatchType = launcher.inSlot
-        ? (isTakeable(target) ? 'close' : 'hold')
-        : isTakeable(launcher)
-          ? (isTakeable(target) ? 'double' : 'hold')
-          : 'dig';
-
-      opportunities.push({
-        elementId: g.elementId, launcher, target,
-        matchCost: sim.peak,
-        cost: {
-          region,
-          preexisting: sim.preexisting,
-          occupancy: sim.occupancy,
-          residual: sim.residual,
-          steps: sim.steps,
-          picks: sim.picks,
-          strategy: sim.strategy,
-        },
-        type,
-        executable: emptySlots >= sim.peak,
-      });
     }
   });
 
+  // 已验算(close / double)在前按消耗升序,未验算(hold / dig)在后;
+  // 同段内按 elementId / 启动牌 / 目标牌(确定性)
   opportunities.sort((a, b) =>
-    a.matchCost - b.matchCost
+    (b.matchCost !== undefined ? 1 : 0) - (a.matchCost !== undefined ? 1 : 0)
+    || (a.matchCost ?? Infinity) - (b.matchCost ?? Infinity)
     || (a.elementId < b.elementId ? -1 : a.elementId > b.elementId ? 1 : 0)
     || a.launcher.tileId - b.launcher.tileId
     || a.target.tileId - b.target.tileId);
@@ -548,6 +504,102 @@ function matchOpportunities(
   opportunities.forEach(o => { byType[o.type]++; });
 
   return { opportunities, byElement, emptySlots, byType };
+}
+
+/** 某元素的配对候选牌:槽内(至多 1 张,成本 0)+ 已识别 pile 牌(成本 = flatCostOf)。
+ *  报告期的配对枚举(matchOpportunities)取自同一份候选 */
+function matchCandidatesOf(g: ElementGroup, analysis: AnalysisResult): MatchTileRef[] {
+  const candidates: MatchTileRef[] = [];
+  if (g.slot.length > 0) {
+    candidates.push({ tileId: g.slot[0], acquireCost: 0, revealCount: 0, inSlot: true });
+  }
+  for (const r of g.pile) {
+    candidates.push({
+      tileId: r.tileId,
+      acquireCost: flatCostOf(r.tileId, analysis),
+      revealCount: analysis.closureSize.get(r.tileId) ?? 0,
+      inSlot: false,
+    });
+  }
+  return candidates;
+}
+
+/** 配对内排序:启动牌 = 获取成本低者(平则 tileId 小者);目标牌 = 另一张 */
+function orderPair(p: MatchTileRef, q: MatchTileRef): [MatchTileRef, MatchTileRef] {
+  return p.acquireCost < q.acquireCost
+    || (p.acquireCost === q.acquireCost && p.tileId < q.tileId) ? [p, q] : [q, p];
+}
+
+/** 配对的稳定身份:无序 tileId 对(tileId 升序);与 launcher / target 角色无关 */
+function pairIdOf(a: MatchTileRef, b: MatchTileRef): [number, number] {
+  return a.tileId < b.tileId ? [a.tileId, b.tileId] : [b.tileId, a.tileId];
+}
+
+/** 配对分类(由两张牌能否直接拿到导出;分类不需要验算):槽内 + 可点 = close;
+ *  两张可点 = double;一张能拿到、另一张被压 = hold;两张都被压 = dig */
+function classifyPair(launcher: MatchTileRef, target: MatchTileRef): MatchType {
+  return launcher.inSlot
+    ? (isTakeable(target) ? 'close' : 'hold')
+    : isTakeable(launcher)
+      ? (isTakeable(target) ? 'double' : 'hold')
+      : 'dig';
+}
+
+/**
+ * 验算一条配对(报告期的唯一验算路径;verifyMatches 的幂等重算同出此一处):
+ * 挖掘区 → 消除模拟(两组贪心取最小)→ 消耗分解 → 可执行性。
+ */
+function opportunityOf(
+  view: SubjectiveView,
+  analysis: AnalysisResult,
+  closureOf: (id: number) => number[],
+  elementId: string,
+  p: MatchTileRef,
+  q: MatchTileRef,
+): MatchOpportunity {
+  const [launcher, target] = orderPair(p, q);
+
+  // 挖掘区:两牌闭包并集(共同路径只计一次;tileId 升序)
+  const regionSet = new Set<number>();
+  for (const id of closureOf(launcher.tileId)) regionSet.add(id);
+  for (const id of closureOf(target.tileId)) regionSet.add(id);
+  const region = [...regionSet].sort((a, b) => a - b);
+
+  const sim = simulateMatch(view, launcher.tileId, target.tileId, region, closureOf,
+    analysis.occlusion, analysis.derived);
+
+  return {
+    elementId, pairId: pairIdOf(launcher, target), launcher, target,
+    type: classifyPair(launcher, target),
+    matchCost: sim.peak,
+    cost: {
+      region,
+      preexisting: sim.preexisting,
+      occupancy: sim.occupancy,
+      residual: sim.residual,
+      steps: sim.steps,
+      picks: sim.picks,
+      pairPicks: sim.pairPicks,
+      external: sim.external,
+      strategy: sim.strategy,
+    },
+    executable: SLOT_COUNT - view.slot.length >= sim.peak,
+  };
+}
+
+/**
+ * 幂等重算一条已验算的配对(2026-11-25 起报告期已对全部配对验算,本函数不再有
+ * 「补验算」职责,保留为测试的「同一条代码路径」对账入口与工具用):对每条重跑
+ * 挖掘区 → 消除模拟 → 可执行性,返回新记录(入参不动)。闭包索引批量共用一份
+ */
+export function verifyMatches(
+  view: SubjectiveView,
+  analysis: AnalysisResult,
+  pairs: ReadonlyArray<MatchOpportunity>,
+): MatchOpportunity[] {
+  if (pairs.length === 0) return [];
+  const closureOf = makeClosureIndex(analysis.blockersOf);
+  return pairs.map(p => opportunityOf(view, analysis, closureOf, p.elementId, p.launcher, p.target));
 }
 
 // ─────────────────────────── 消除模拟(匹配消耗的前向模型,主观) ───────────────────────────
@@ -599,12 +651,16 @@ interface MatchSimulation {
   preexisting: number[];
   /** 逐步净占用序列(阶段 2 读数) */
   occupancy: number[];
-  /** 结束时槽内剩余的牌 */
+  /** 滞留牌:这条路线自己带进槽、模拟结束时仍出不去的牌(不含槽内原有的牌) */
   residual: number[];
   /** 拿牌次数 */
   steps: number;
   /** 拿牌顺序(每次 take 的 tileId,与 steps 对应) */
   picks: number[];
+  /** 到配对完成为止的拿牌次数 */
+  pairPicks: number;
+  /** 外部资源使用计数:计划拿牌里不属于挖掘区的张数(见 MatchCostBreakdown.external) */
+  external: number;
   /** 胜出的拿牌策略(两组各跑一遍取峰值最小者;见 SimStrategy) */
   strategy: SimStrategy;
 }
@@ -692,12 +748,19 @@ export function simulateMatch(
     const picks: number[] = [];
     let peak = 0;
     let steps = 0;
+    /** 到配对完成为止的拿牌次数:两张配对牌都离场时的累计拿牌数 */
+    let pairPicks = 0;
 
     /** 已移除集 + 各牌当前是否被压(增量维护,见 createClickTracker) */
     const tracker = createClickTracker(view, occlusion, derived);
     const removed = tracker.removed;
     /** 当前主观可点牌(升序) */
     const clickableNow = (): number[] => tracker.clickable();
+
+    /** 某张配对牌是否已离场:模拟开始时就在槽里的,看它是否已被配掉;
+     *  从堆上拿进来的,看它是否已被拿走 */
+    const gone = (id: number): boolean =>
+      preexistingSet.has(id) ? slot.indexOf(id) < 0 : removed.has(id);
 
     /** 槽内的 x 能否与牌 y 配对(来源规则):
      *  本次配对的 (launcher, target) → 总是可以(它们本就该配;
@@ -752,12 +815,16 @@ export function simulateMatch(
       if (net > peak) peak = net;
       settle();                                 // ③ 检查匹配并消除
       steps++;                                  // ④(占用由下次 ② 重读)
+      if (pairPicks === 0 && gone(launcherId) && gone(targetId)) {
+        pairPicks = steps;                      // 配对恰在此拿完成
+      }
     };
 
-    /** 本次配对是否已完成:两张牌都已离场 */
+    /** 本次配对是否已完成:两张牌都已离场
+     *  (不用 Array.includes(ES2016)——编辑器编译目标的 lib 不含它,以工程级类型检查为准) */
     const pairDone = (): boolean =>
       removed.has(launcherId) && removed.has(targetId)
-      && !slot.includes(launcherId) && !slot.includes(targetId);
+      && slot.indexOf(launcherId) < 0 && slot.indexOf(targetId) < 0;
 
     /** 为槽内「模拟带入的」牌找当前可点的伴(策略 settle-first 与清槽阶段共用)。
      *  只为模拟带入的牌找——原有的槽内牌不在此清(它们的伴只在闭包内,
@@ -812,8 +879,17 @@ export function simulateMatch(
       if (m !== undefined) { take(m); acted = true; }
     }
 
-    for (const id of slot) residual.push(id);
-    return { peak, preexisting, occupancy, residual, steps, picks };
+    // 结束时仍在模拟槽里的牌 = 原有的 + 这条路线带入而出不去的。residual 只记后者:
+    // 原有的牌是模拟开始时的既成事实(另记 preexisting),与这条路线无关
+    for (const id of slot) {
+      if (!preexistingSet.has(id)) residual.push(id);
+    }
+    let external = 0;
+    for (const id of picks) {
+      if (regionSet.has(id) || id === launcherId || id === targetId) continue;
+      external++;                                  // 闭包以外的牌(配对两张是目标,不计)
+    }
+    return { peak, preexisting, occupancy, residual, steps, picks, pairPicks, external };
   };
 
   // ── A+B:各策略跑一遍,取峰值最小者 ──

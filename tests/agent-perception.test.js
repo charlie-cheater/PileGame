@@ -21,7 +21,7 @@ const { fillSlots } = require('../temp/v3check/core/RandomFill');
 const { buildMahjongElements } = require('../temp/v3check/core/MahjongSet');
 const { lcg } = require('../temp/v3check/core/LevelBuilder');
 const { perceive, UNKNOWN_ELEMENT } = require('../temp/v3check/agent/Perception');
-const { analyze, analyzeStructure, simulateMatch, simulateReveal } = require('../temp/v3check/agent/Analysis');
+const { analyze, analyzeStructure, simulateMatch, simulateReveal, verifyMatches } = require('../temp/v3check/agent/Analysis');
 const { decideByLadder, defaultLadder } = require('../temp/v3check/agent/Ladder');
 
 let pass = 0, fail = 0;
@@ -402,7 +402,12 @@ console.log('— 分析扩展:匹配消耗 v4(消除模拟的净占用峰值)—
     ({ elementId, variant: 'FULL', gx, gy, layer, tileId, status: 'pile', slotIndex: null });
   const an = (tiles, slot = []) => analyze({ perceived: tiles, slot, exposure: new Map(),
     totalPileCount: tiles.length + slot.length });
-  const opOf = (tiles, slot) => an(tiles, slot).matches.opportunities.find(o => o.elementId === 'e');
+  // 取该元素的配对(报告期已逐条验算);pick = 可选的挑选谓词(同一元素有多条配对时用)
+  const opOf = (tiles, slot = [], pick) => {
+    const list = an(tiles, slot).matches.opportunities;
+    return (pick ? list.filter(pick) : list).find(o => o.elementId === 'e')
+      ?? list.find(o => o.elementId === 'e');
+  };
   const seq = (o) => o.cost.occupancy.join(',');
 
   // T1 double:两张都可点,挖掘区空
@@ -485,8 +490,10 @@ console.log('— 分析扩展:匹配消耗 v4(消除模拟的净占用峰值)—
   {
     const A = an([mkS(0, 'e', 0, 10, 0), mkS(1, 'e', 30, 10, 0), mkS(2, 'e', 0, 10, 1),
       mkS(3, 'z', 0, 10, 2)]);
-    const t8 = A.matches.opportunities.find(o => o.elementId === 'e');
-    check('T8 中间那张被选为 target:launcher l / target c(c 压着 t ⇒ 闭包(c) < 闭包(t))',
+    const t8 = opOf([mkS(0, 'e', 0, 10, 0), mkS(1, 'e', 30, 10, 0), mkS(2, 'e', 0, 10, 1),
+      mkS(3, 'z', 0, 10, 2)], [],
+      o => o.launcher.tileId === 1 && o.target.tileId === 2);
+    check('T8 中间那张被选为 target(全量清单下验算 (l, c) 这一条):launcher l / target c(c 压着 t ⇒ 闭包(c) < 闭包(t))',
       t8.launcher.tileId === 1 && t8.target.tileId === 2
         && (A.closureSize.get(2) ?? 0) < (A.closureSize.get(0) ?? 0),
       `launch=${t8.launcher.tileId} target=${t8.target.tileId}`);
@@ -507,6 +514,22 @@ console.log('— 分析扩展:匹配消耗 v4(消除模拟的净占用峰值)—
   // T10 executable 由 peak 与空槽数直接比较得出
   check('T10 可执行性 = 峰值 ≤ 空槽数(T1 峰值 2 ≤ 空槽 4 → 可执行)',
     t1.executable === true && t1.matchCost <= 4);
+
+  // T11 pairPicks:到配对完成为止的拿牌次数(2026-11-25 设计者指示)——含完成配对的那一拿,
+  //     配对完成后的清槽拿牌不计;close / double 恒为 1 / 2
+  check('T11 close / double:pairPicks = 1 / 2',
+    (() => {
+      const held = mkS(9, 'e', 18, 10, 0);
+      held.status = 'slot';
+      held.slotIndex = 0;
+      return opOf([mkS(0, 'e', 0, 10, 0)], [held]).cost.pairPicks === 1;
+    })() && t1.cost.pairPicks === 2);
+  check('T11 hold:配对在第 3 拿完成(拿 l → p → t,与 l 消)→ pairPicks 3 = steps 3',
+    t3.cost.pairPicks === 3 && t3.cost.steps === 3);
+  check('T11 hold + 伴可点:配对在第 3 拿完成,第 4 拿(pMate)是清槽 → pairPicks 3 < steps 4',
+    t4.cost.pairPicks === 3 && t4.cost.steps === 4 && t4.cost.picks.length === 4);
+  check('T11 dig:两牌都要挖(拿 f → t → g → l,与 t 消)→ pairPicks 4',
+    t5.cost.pairPicks === 4 && t5.cost.steps === 4);
 }
 
 {
@@ -573,12 +596,14 @@ console.log('— 分析扩展:匹配消耗 v4(消除模拟的净占用峰值)—
       && o.cost.occupancy.length === o.cost.steps && o.cost.occupancy.length > 0));
   check('峰值 ≥ 1 且 ≤ 模拟拿牌数(净占用不可能超过入槽总数)',
     r2.opportunities.every(o => o.matchCost >= 1 && o.matchCost <= o.cost.steps));
+  check('pairPicks(到配对完成为止的拿牌数):≥ 2 且 ≤ steps;pairPicks 之前配对牌均已离场',
+    r2.opportunities.every(o => o.cost.pairPicks >= 2 && o.cost.pairPicks <= o.cost.steps));
   check('相邻读数之差 ∈ {−1, +1}:每次拿 1 张入槽(+1)后 0 或 1 次消除(−2)→ 净变化 +1 / −1',
     r2.opportunities.every(o => o.cost.occupancy.every((v, i) =>
       i === 0 || v - o.cost.occupancy[i - 1] === 1 || v - o.cost.occupancy[i - 1] === -1)));
   check('可执行性 = 峰值 ≤ 空槽数',
     r2.opportunities.every(o => o.executable === (o.matchCost <= r2.emptySlots)));
-  check('排序:matchCost 升序',
+  check('排序:matchCost 升序(报告期全量验算,单一升序段)',
     r2.opportunities.every((o, i) => i === 0 || r2.opportunities[i - 1].matchCost <= o.matchCost));
 
   // 剩余牌的不变量:都是感知牌;其伴(若已知)既不在槽内也不可点——否则清槽会拿走
@@ -586,12 +611,13 @@ console.log('— 分析扩展:匹配消耗 v4(消除模拟的净占用峰值)—
     .filter(t => result.derived.get(t.tileId)?.clickable === true).map(t => t.tileId));
   const slotIds = new Set(view.slot.map(s => s.tileId));
   const elemOf = new Map(view.perceived.map(t => [t.tileId, t.elementId]));
-  check('剩余牌:伴不可点且不在槽内(否则清槽阶段会拿走)',
+  check('剩余牌:伴不可点、不在槽内、也不在本计划的拿牌里,否则清槽阶段会拿走(配对牌的元素除外——它们只等彼此,不找外部伴)',
     r2.opportunities.every(o => o.cost.residual.every(id => {
       const e = elemOf.get(id);
       if (e === undefined || e === UNKNOWN_ELEMENT) return true;
+      if (e === elemOf.get(o.launcher.tileId) || e === elemOf.get(o.target.tileId)) return true;
       return !view.perceived.some(p => p.tileId !== id && elemOf.get(p.tileId) === e
-        && clickableNow.has(p.tileId))
+        && clickableNow.has(p.tileId) && !o.cost.picks.includes(p.tileId))
         && !view.slot.some(s => s.elementId === e);
     })));
   check('剩余牌无同元素对(槽内留下的牌之间不能互配)',
@@ -607,6 +633,28 @@ console.log('— 分析扩展:匹配消耗 v4(消除模拟的净占用峰值)—
     }));
   check('原有槽内牌 = 当前槽内牌(开局为空)',
     r2.opportunities.every(o => o.cost.preexisting.length === view.slot.length));
+
+  // 12. residual 不含槽内原有的牌(2026-11-25 设计者裁定:字段定义如此)——用槽内有牌的盘面验证
+  {
+    // 槽内预置 U(0) V(1) 两张互不同元素的半张,再握 X 半张(2);X 的目标(3)被 A(4) 压(A 无伴)
+    //   hold (2,3):拿 A(4) → 拿 3 与槽内 2 配;A 出不去 → residual 恰为 [4]
+    //   槽内原有的 0 1 2 是既成事实(另记 preexisting),不计入 residual
+    const spec = [['U', 0, 2, 0], ['V', 8, 2, 0], ['X', 16, 2, 0], ['X', 56, 2, 0], ['A', 56, 12, 1]];
+    const b = new Board({
+      board: { w: 80, h: 24 },
+      elements: [...new Set(spec.map(s => s[0]))].map(e => ({ elementId: e, displayName: e, color: '#fff' })),
+      tiles: spec.map(([elementId, gx, gy, layer], i) => ({ elementId, variant: 'FULL', gx, gy, layer, tileId: i })),
+    });
+    b.pick(0); b.pick(1); b.pick(2);
+    const m = analyze(perceive(b)).matches;
+    const hold = m.opportunities.find(o => o.elementId === 'X' && o.type === 'hold');
+    check('residual 字段不含槽内原有的牌:槽内原有 [0,1,2],路线只带入 A(4) → residual 恰为 [4]',
+      hold !== undefined && m.emptySlots === 1
+      && JSON.stringify(hold.cost.preexisting) === '[0,1,2]'
+      && JSON.stringify(hold.cost.picks) === '[4,3]'
+      && JSON.stringify(hold.cost.residual) === '[4]',
+      `pre=[${hold && hold.cost.preexisting}] picks=[${hold && hold.cost.picks}] res=[${hold && hold.cost.residual}]`);
+  }
 
   const cheapest = r2.opportunities[0];
   const peaks = r2.opportunities.map(o => o.matchCost);
@@ -660,15 +708,21 @@ console.log('— 结果层等价性回归:新模拟 ⇔ 旧的逐步全盘重算
       while (paired) {
         paired = false;
         outer: for (let i = 0; i < slot.length; i++) {
-          const e = elemOf.get(slot[i]);
+          const x = slot[i];
+          const e = elemOf.get(x);
           if (e === undefined || e === UNKNOWN_ELEMENT) continue;
           for (let j = i + 1; j < slot.length; j++) {
-            if (elemOf.get(slot[j]) === e) {
-              slot.splice(j, 1);
-              slot.splice(i, 1);
-              paired = true;
-              break outer;
-            }
+            const y = slot[j];
+            if (elemOf.get(y) !== e) continue;
+            // 精确镜像 canPairInSim 的来源规则:配对牌只跟彼此配(一侧是配对牌、另一侧不是 → 不配);
+            // 两侧都是「模拟带入的」非配对牌 → 可配(槽空时全部候选都是带入的,恒可配)
+            const xP = x === launcherId || x === targetId;
+            const yP = y === launcherId || y === targetId;
+            if (xP !== yP) continue;
+            slot.splice(j, 1);
+            slot.splice(i, 1);
+            paired = true;
+            break outer;
           }
         }
       }
@@ -687,6 +741,15 @@ console.log('— 结果层等价性回归:新模拟 ⇔ 旧的逐步全盘重算
     };
 
     const regionSet = new Set(region);
+    // 2026-11-25 来源规则:本次配对的两张(launcher / target)只跟彼此配,其元素不与
+    // 第三张同元素牌配。旧实现无此规则;全量清单的对局会走进「配对牌的第三张同元素
+    // 牌被当作 closing 候选拿进来」的盘面,此处同步补上,使「槽空 dig-only ≡ 旧参照」
+    // 继续只考察遮挡机制本身(增量维护 ≡ 全盘重算),而非配对规则的差异。
+    const pairElems = new Set();
+    for (const id of [launcherId, targetId]) {
+      const e = elemOf.get(id);
+      if (e !== undefined && e !== UNKNOWN_ELEMENT) pairElems.add(e);
+    }
     const digAndTake = (goal) => {
       const own = new Set(closureOf(goal));
       let guard = 0;
@@ -713,12 +776,20 @@ console.log('— 结果层等价性回归:新模拟 ⇔ 旧的逐步全盘重算
         const x = slot[i];
         const e = elemOf.get(x);
         if (e === undefined || e === UNKNOWN_ELEMENT) continue;
+        // 配对牌的元素不在清槽阶段找伴(新实现的 findMateForBrought 同样跳过)
+        if (pairElems.has(e)) continue;
         const mate = click.find(id => onPile(id) && elemOf.get(id) === e);
         if (mate !== undefined) { take(mate); acted = true; break; }
       }
     }
 
-    for (const id of slot) residual.push(id);
+    // residual 口径同步(2026-11-25 设计者裁定:residual 字段本身不计入槽内原有的牌)。
+    // 旧实现原样会把模拟结束时槽内全部剩余牌记为 residual;现实现只记这条路线
+    // 自己带入而出不去的。参照在此同步收窄,使对账仍只考察遮挡机制与配对规则本身。
+    const preSet = new Set(preexisting);
+    for (const id of slot) {
+      if (!preSet.has(id)) residual.push(id);
+    }
     return { peak, preexisting, occupancy, residual, steps, picks };
   }
 
@@ -771,13 +842,20 @@ console.log('— 结果层等价性回归:新模拟 ⇔ 旧的逐步全盘重算
         S.steps++; S.minTiles = Math.min(S.minTiles, view.perceived.length); S.maxTiles = Math.max(S.maxTiles, view.perceived.length);
 
         // ① 每条匹配:与旧参照(2026-11-24 之前的实现,逐字保留)对照。
-        //    2026-11-25 起消除模拟有两处设计变更,与旧参照不再逐字段等价:
+        //    2026-11-25 起消除模拟有三处设计变更,与旧参照不再逐字段等价:
         //      · 来源规则:模拟开始时槽内原有的牌只与闭包内的牌配对(旧实现会给它们找闭包外的可点伴)
         //      · 两组贪心取最小:新增 settle-first 策略(挖掘途中先把「模拟带入的牌」的可点伴拿来消掉)
-        //    故等价性只在**槽空**的局面上成立(此时 dig-only 策略 = 旧实现);
+        //      · 配对两张只跟彼此配:第三张同元素牌被当作 closing 候选拿进来时不与等待中的
+        //        启动牌/目标牌配(旧实现无此限制,峰值会更低——2026-11-25 全量清单的对局
+        //        走进了这类盘面,故旧参照的结算与清槽同步补上本规则,见其内注释)
+        //    故等价性只在**槽空**的局面上成立(此时 dig-only 策略 = 旧实现 + 上述配对规则);
         //    槽内有原有牌时只要求「不劣于旧参照」。
         const closureOf = closureIndexOf(a);
-        for (const o of a.matches.opportunities) {
+        // 报告期已对全部配对验算(2026-11-25 设计者指示)——等价性对账直接逐条跑;
+        // 全量清单条目多,按步长抽样至多 20 条以约束套件耗时(对账走同一条模拟代码路径)
+        const stride = Math.max(1, Math.ceil(a.matches.opportunities.length / 20));
+        const all = a.matches.opportunities.filter((_, i) => i % stride === 0);
+        for (const o of all) {
           S.entries++; S.simSteps += o.cost.steps;
           if (o.cost.residual.length > 0) S.withResidual++;
           if (o.launcher.inSlot) S.launcherInSlot++;
@@ -903,7 +981,7 @@ console.log('— 结果层等价性回归:新模拟 ⇔ 旧的逐步全盘重算
     S.badReveal === 0, `${S.badReveal}/${S.reveals} 次不一致`);
 }
 
-console.log('— MatchReport 配对保留口径(2026-11-24:两张都能直接拿到的全留,需挖掘的每元素留最便宜一对)—');
+console.log('— MatchReport 全量清单(2026-11-25 设计者定稿:全部配对记录、分类并逐条验算)—');
 {
   // 盖牌上移 / 错层,使被压牌「可见、可识别,但不可点」(整张盖住的牌不进感知集)
   const spec = [
@@ -922,7 +1000,8 @@ console.log('— MatchReport 配对保留口径(2026-11-24:两张都能直接拿
   };
   const board = new Board(level);
   board.pick(0);                                   // e1 的第一张入槽
-  const result = analyze(perceive(board));
+  const view = perceive(board);
+  const result = analyze(view);
   const m = result.matches;
   const of = e => m.byElement.get(e) ?? [];
   const shape = e => of(e).map(o => `${o.type}(${o.launcher.tileId},${o.target.tileId})`).join(' ');
@@ -948,22 +1027,32 @@ console.log('— MatchReport 配对保留口径(2026-11-24:两张都能直接拿
         && !!dbl && dbl.matchCost === 2 && dbl.cost.occupancy.join(',') === '1,2',
         e1.map(o => `${o.type}:${o.matchCost}:${o.cost.occupancy}`).join(' '));
     }
-  check('可点 3 张:double ×3 全部保留',
+  check('可点 3 张:double ×3 全部记录',
     shape('e4') === 'double(14,15) double(14,16) double(15,16)', shape('e4'));
-  check('可点 1 张 + 被压 2 张:只留最便宜的一对(hold,目标 = 闭包小的那张 9)',
-    shape('e3') === 'hold(8,9)', shape('e3'));
-  check('被压 2 张:只留最便宜的一对(dig,启动牌 = 闭包小的那张 3)',
-    shape('e2') === 'dig(3,5)', shape('e2'));
-  check('byType 按配对计数:close 2 / double 4 / hold 1 / dig 1',
-    JSON.stringify(m.byType) === '{"close":2,"double":4,"hold":1,"dig":1}', JSON.stringify(m.byType));
+  check('可点 1 张 + 被压 2 张:全部记录(hold ×2 + dig ×1,报告期已验算)',
+    shape('e3') === 'hold(8,9) hold(8,11) dig(9,11)' && of('e3').every(o => o.cost !== undefined), shape('e3'));
+  check('被压 2 张:1 条 dig(启动牌 = 闭包小的那张 3),已验算',
+    shape('e2') === 'dig(3,5)' && of('e2')[0].cost !== undefined, shape('e2'));
+  check('byType 按配对计数:close 2 / double 4 / hold 2 / dig 2',
+    JSON.stringify(m.byType) === '{"close":2,"double":4,"hold":2,"dig":2}', JSON.stringify(m.byType));
   check('byElement 与 opportunities 一致:条目总数相同,元素内顺序相同',
     m.opportunities.length === [...m.byElement.values()].reduce((s, a) => s + a.length, 0)
     && [...m.byElement].every(([e, os]) => JSON.stringify(os) === JSON.stringify(m.opportunities.filter(o => o.elementId === e))),
     `${m.opportunities.length} 对 ${[...m.byElement.values()].reduce((s, a) => s + a.length, 0)}`);
-  check('排序:消耗升序 → elementId → 启动牌 → 目标牌',
+  check('pairId:每条配对带无序对身份(tileId 升序,成员即配对两张),全报告唯一',
+    m.opportunities.every(o => Array.isArray(o.pairId) && o.pairId[0] < o.pairId[1]
+      && o.pairId.every(id => id === o.launcher.tileId || id === o.target.tileId))
+    && new Set(m.opportunities.map(o => o.pairId.join(':'))).size === m.opportunities.length);
+  check('排序:matchCost 升序(全量验算,单一升序段)',
     m.opportunities.map(o => `${o.elementId}:${o.type}:${o.matchCost}`).join(' ')
-      === 'e1:close:1 e1:close:1 e1:double:2 e4:double:2 e4:double:2 e4:double:2 e3:hold:3 e2:dig:5',
+      === 'e1:close:1 e1:close:1 e1:double:2 e4:double:2 e4:double:2 e4:double:2 e3:hold:3 e3:hold:4 e2:dig:5 e3:dig:5',
     m.opportunities.map(o => `${o.elementId}:${o.type}:${o.matchCost}`).join(' '));
+  // 验算值:e3 的三条峰值 3 / 4 / 5;峰值 ≤ 空槽 3 的只有 (8,9)
+  check('验算值:e3 的三条峰值 3 / 4 / 5,可执行 true / false / false(空槽 3)',
+    m.opportunities.filter(o => o.elementId === 'e3').map(o => `${o.matchCost}:${o.executable}`).join(' ') === '3:true 4:false 5:false',
+    m.opportunities.filter(o => o.elementId === 'e3').map(o => `${o.matchCost}:${o.executable}`).join(' '));
+  check('幂等重算(verifyMatches 与报告期同一条代码路径):逐字段一致',
+    JSON.stringify(verifyMatches(view, result, m.opportunities)) === JSON.stringify(m.opportunities));
 }
 
 console.log(`\n结果:${pass} 通过,${fail} 失败`);

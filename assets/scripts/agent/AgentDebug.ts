@@ -227,8 +227,8 @@ export function attachAgentDebug(pile: PileView, board: Board, opts: AgentDebugO
       info2.string = '身份未识别(?)——不参与匹配计算';
       return;
     }
-    // 该元素保留的配对(2026-11-24 起可有多条:两张都能直接拿到的全留,需挖掘的留最便宜
-    // 一条)。面板展示本牌参与的最便宜一条;本牌不参与时退到该元素最便宜的一条
+    // 该元素的全部配对(2026-11-25 起报告期全量记录、分类并验算)。展示本牌参与的
+    // 最便宜一条;本牌不参与时退到该元素最便宜的一条
     const pairings = matches.byElement.get(t.elementId) ?? [];
     const mine = pairings.filter(o => o.launcher.tileId === tileId || o.target.tileId === tileId);
     const op = mine[0] ?? pairings[0];
@@ -288,6 +288,7 @@ export function attachAgentDebug(pile: PileView, board: Board, opts: AgentDebugO
         ? ` · 搭档 ${nameOf(partnerId)}@L${board.getTile(partnerId)!.layer}`
         : '')
       + ` · 消耗 ${op.matchCost}/${matches.emptySlots} 格(峰值)`
+      + ` · ${op.cost.pairPicks} 拿成对(共 ${op.cost.steps} 拿)`
       + ` · 占用 ${op.cost.occupancy.join('›')}`
       + ` · 剩 ${op.cost.residual.length} 张`
       + (op.cost.residual.length

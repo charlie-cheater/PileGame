@@ -14,7 +14,8 @@ import { _decorator, Component, Node, UITransform, Graphics, Label, Color, JsonA
 import { Board } from '../core/Board';
 import { buildLevel, LevelSpec } from '../core/LevelBuilder';
 import { buildMahjongElements } from '../core/MahjongSet';
-import { LevelData } from '../core/tile';
+import { solvePile } from '../core/PileSolver';
+import { LevelData, TILE } from '../core/tile';
 import { PileView } from '../view/PileView';
 import { TrayView } from '../view/TrayView';
 
@@ -28,9 +29,18 @@ export class GameController extends Component {
    *  空 = 默认金字塔(seed 42)。编辑器 Inspector 里填,点重开即换关 */
   @property
   playLevel = '';
+  /** 回放求解器见证:加载后自动求解,按固定间隔逐步演示解法(关卡需可解,不可解回落普通游玩) */
+  @property
+  replaySolve = false;
+  /** 回放步间隔(秒);实际节奏 = max(间隔, 单手动画时长) */
+  @property
+  replayInterval = 1.0;
   private pile!: PileView;
   private tray: TrayView | null = null;
   private locked = false;
+  private replayGen = 0;        // 回放代际令牌:startWith 递增,旧循环失配即自停
+  private replayQueue: number[] = [];
+  private replayTotal = 0;
   private overlay: Node | null = null;
 
   protected start(): void {
@@ -51,7 +61,7 @@ export class GameController extends Component {
           this.startPyramid();
           return;
         }
-        this.startWith(asset.json as unknown as LevelData);
+        this.startWith(asset.json as unknown as LevelData, true);
       });
       return;
     }
@@ -65,20 +75,93 @@ export class GameController extends Component {
       pairsPerElement: 1,
       seed: 42,
     };
-    this.startWith(buildLevel(spec));
+    this.startWith(buildLevel(spec), false);
   }
 
-  /** 公共启动:Board 构建 + 视图接线 + 解锁 */
-  private startWith(level: LevelData): void {
+  /** 版宽对齐与单张上限(与 LayoutPreview 同口径;MAX_TILE_PX = 场景实例校准值 96,非类默认 150) */
+  private static readonly DESIGN_W = 750;
+  private static readonly WIDTH_MARGIN = -60;
+  private static readonly MAX_TILE_PX = 96;
+
+  /** 公共启动:Board 构建 + 视图接线 + 解锁。
+   *  fitView = 关卡文件路径:按实际包围盒重定中心 + 适配缩放(与 LayoutPreview 同口径);
+   *  默认金字塔传 false,沿用已校准的固定视角(15px,板中心枢轴) */
+  private startWith(level: LevelData, fitView: boolean): void {
+    this.replayGen++;   // 作废可能残留的旧回放循环
     this.board = new Board(level);
-    this.pile.unitPx = 15;   // TILE 8×10 后,维持牌面 120×150px 视觉
+    if (fitView) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const t of level.tiles) {
+        minX = Math.min(minX, t.gx);            minY = Math.min(minY, t.gy);
+        maxX = Math.max(maxX, t.gx + TILE.w);   maxY = Math.max(maxY, t.gy + TILE.h);
+      }
+      const layoutW = maxX - minX, layoutH = maxY - minY;
+      const unit = Math.min(
+        (GameController.DESIGN_W + GameController.WIDTH_MARGIN) / layoutW,
+        GameController.MAX_TILE_PX / TILE.w,
+      );
+      this.pile.unitPx = unit;
+      this.pile.pivotX = (minX + maxX) / 2;
+      this.pile.pivotY = (minY + maxY) / 2;
+    } else {
+      this.pile.unitPx = 15;   // TILE 8×10 后,维持牌面 120×150px 校准视觉
+      this.pile.pivotX = null; // pivot 跨 setup 持久,回退时须清掉上一关的包围盒枢轴
+      this.pile.pivotY = null;
+    }
     this.pile.setup(this.board, level.elements);
-    this.pile.onTileClicked = id => this.onTileClicked(id);
+    this.pile.onTileClicked = id => this.onUserClicked(id);
     this.locked = false;
     this.dismissOverlay();
+    if (this.replaySolve) this.startReplay();
+  }
+
+  // ─────────────────────────── 求解回放 ───────────────────────────
+
+  /** 求解当前盘并按 replayInterval 逐步演示见证 */
+  private startReplay(): void {
+    const gen = this.replayGen;
+    const t0 = Date.now();
+    const res = solvePile(
+      this.board.allTiles().filter(t => t.status === 'pile'),
+      { maxNodes: 2000000 });
+    if (res.status !== 'solved') {
+      console.warn('[GameController] 回放:求解器未给出见证(' + res.status
+        + ', nodes=' + res.nodes + ', ' + (Date.now() - t0) + 'ms),回落普通游玩');
+      return;
+    }
+    console.log('[GameController] 回放:见证 ' + res.witness.length + ' 手,nodes='
+      + res.nodes + ',耗时 ' + (Date.now() - t0) + 'ms');
+    this.replayQueue = res.witness.slice();
+    this.replayTotal = res.witness.length;
+    this.scheduleOnce(() => this.replayStep(gen), this.replayInterval);
+  }
+
+  /** 回放一步:走与玩家完全相同的点击管线;上一步动画未完则稍后重试(不丢步) */
+  private replayStep(gen: number): void {
+    if (gen !== this.replayGen || this.replayQueue.length === 0) return;
+    if (this.locked) { this.scheduleOnce(() => this.replayStep(gen), 0.1); return; }
+    const tileId = this.replayQueue.shift()!;
+    // 见证外因(理论不可达:求解器保证逐步可点)→ 停回放,现场交还玩家
+    if (!this.board.getDerived(tileId)?.clickable) {
+      console.warn('[GameController] 回放中止:第 '
+        + (this.replayTotal - this.replayQueue.length) + ' 手 tile ' + tileId + ' 不可点');
+      this.replayQueue = [];
+      return;
+    }
+    console.log('[GameController] 回放 '
+      + (this.replayTotal - this.replayQueue.length) + '/' + this.replayTotal
+      + ': tile ' + tileId);
+    this.onTileClicked(tileId);
+    this.scheduleOnce(() => this.replayStep(gen), this.replayInterval);
   }
 
   // ─────────────────────────── 主循环 ───────────────────────────
+
+  /** 玩家点击入口:回放期间忽略手动点击(回放自身走 onTileClicked 直调,不经此门) */
+  private onUserClicked(tileId: number): void {
+    if (this.replayQueue.length > 0) return;
+    this.onTileClicked(tileId);
+  }
 
   private onTileClicked(tileId: number): void {
     if (this.locked || !this.tray) return;

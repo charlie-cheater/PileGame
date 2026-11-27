@@ -99,7 +99,7 @@
     "_lpos": {
       "__type__": "cc.Vec3",
       "x": 375,
-      "y": 832,
+      "y": 812,
       "z": 0
     },
     "_lrot": {
@@ -184,7 +184,7 @@
     "_priority": 0,
     "_fov": 45,
     "_fovAxis": 0,
-    "_orthoHeight": 832,
+    "_orthoHeight": 812,
     "_near": 0,
     "_far": 2000,
     "_color": {
@@ -529,7 +529,7 @@
       "__id__": 2
     },
     "_children": [],
-    "_active": true,
+    "_active": false,
     "_components": [
       {
         "__id__": 15
@@ -624,8 +624,7 @@
     },
     "useStrictTorque": true,
     "agentDebug": true,
-    "agentShowEdges": true,
-    "agentShowHidden": true,
+    "agentShowStatic": false,
     "maxTilePx": 96,
     "widthMargin": -60,
     "fillSeed": 7,
@@ -640,7 +639,7 @@
       "__id__": 2
     },
     "_children": [],
-    "_active": false,
+    "_active": true,
     "_components": [
       {
         "__id__": 19
@@ -732,6 +731,9 @@
     },
     "_enabled": true,
     "__prefab": null,
+    "playLevel": "level_23_win",
+    "replaySolve": true,
+    "replayInterval": 1,
     "_id": "5esJ8r/HxN+6pXq2slkY/O"
   },
   {
@@ -747,7 +749,7 @@
     "_contentSize": {
       "__type__": "cc.Size",
       "width": 750,
-      "height": 1664
+      "height": 1624
     },
     "_anchorPoint": {
       "__type__": "cc.Vec2",

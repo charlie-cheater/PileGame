@@ -10,19 +10,24 @@
 // 注:当前印花为全图对(混式难度 FULL 形态);二分半图待正式素材管线
 // ============================================================================
 
-import { _decorator, Component, Node, UITransform, Graphics, Label, Color } from 'cc';
+import { _decorator, Component, Node, UITransform, Graphics, Label, Color, JsonAsset, resources } from 'cc';
 import { Board } from '../core/Board';
 import { buildLevel, LevelSpec } from '../core/LevelBuilder';
 import { buildMahjongElements } from '../core/MahjongSet';
+import { LevelData } from '../core/tile';
 import { PileView } from '../view/PileView';
 import { TrayView } from '../view/TrayView';
 
-const { ccclass } = _decorator;
+const { ccclass, property } = _decorator;
 
 @ccclass('GameController')
 export class GameController extends Component {
 
   private board!: Board;
+  /** 体验测试关卡:resources/levels/ 下的资源名(不含扩展名,如 level_14_win);
+   *  空 = 默认金字塔(seed 42)。编辑器 Inspector 里填,点重开即换关 */
+  @property
+  playLevel = '';
   private pile!: PileView;
   private tray: TrayView | null = null;
   private locked = false;
@@ -33,21 +38,41 @@ export class GameController extends Component {
     const trayNode = this.node.parent?.getChildByName('TrayRoot');
     this.tray = trayNode?.getComponent(TrayView) ?? null;
     this.newGame();
-  }
+     }
 
   // ─────────────────────────── 初始化 / 重开 ───────────────────────────
 
   private newGame(): void {
+    const name = (this.playLevel || '').trim();
+    if (name !== '') {
+      resources.load('levels/' + name, JsonAsset, (err, asset) => {
+        if (err || !asset) {
+          console.warn('[GameController] 关卡加载失败,回退默认金字塔:', name, err);
+          this.startPyramid();
+          return;
+        }
+        this.startWith(asset.json as unknown as LevelData);
+      });
+      return;
+    }
+    this.startPyramid();
+  }
+
+  private startPyramid(): void {
     const spec: LevelSpec = {
       pattern: { kind: 'pyramid', cols: 5, rows: 5, layers: 4 },
       elements: buildMahjongElements(),
       pairsPerElement: 1,
       seed: 42,
     };
-    const level = buildLevel(spec);
+    this.startWith(buildLevel(spec));
+  }
+
+  /** 公共启动:Board 构建 + 视图接线 + 解锁 */
+  private startWith(level: LevelData): void {
     this.board = new Board(level);
     this.pile.unitPx = 15;   // TILE 8×10 后,维持牌面 120×150px 视觉
-    this.pile.setup(this.board, spec.elements);
+    this.pile.setup(this.board, level.elements);
     this.pile.onTileClicked = id => this.onTileClicked(id);
     this.locked = false;
     this.dismissOverlay();

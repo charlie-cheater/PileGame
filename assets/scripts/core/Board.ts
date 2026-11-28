@@ -6,6 +6,7 @@
 //     ——槽位 = status + slotIndex,槽位分配策略(最左空位)在牌桌内
 //   · 操作返回结构化结果(Command result),不发事件;视图/动画由控制器驱动
 //   · pick 内自动配对检测并返回 paired;控制器播完奖励动画后调 eliminate
+//   · assignType(渐进定型,2026-11-27):只改类型,不动几何,不重算派生态
 //   · 不做:动画/音效/输赢决策(控制器/渲染)——本类是纯状态机
 //
 // 依赖:tile.ts(数据契约)、Occlusion.ts(派生态计算)
@@ -15,9 +16,10 @@
 //   · 构造 / 撤回 / 洗牌 → 全量 refresh(并重建牌堆的遮挡关系索引)
 //   · 点击入槽 → 增量:只重算被拿走那张牌直接压着的牌(refreshAfterPick)
 //   · 消除 → 不重算(只动槽内的牌,牌堆没变)
+//   · 定型(assignType)→ 不重算(遮挡 / 可见性 / 可点性只看几何,配对是现算的)
 // ============================================================================
 
-import { Tile, TileDef, TileDerived, LevelData, canPair, findPairInSlot } from './tile';
+import { Tile, TileDef, TileDerived, LevelData, ElementId, canPair, findPairInSlot, isUnassigned } from './tile';
 import { computeOcclusion, buildOcclusionIndex, deriveAfter, OcclusionIndex } from './Occlusion';
 import { computeVisibleState, visibilityAfter, summarizeVisibility, VisibleState } from './Visibility';
 
@@ -105,6 +107,11 @@ export class Board {
   pick(tileId: number): PickResult {
     const t = this.tiles[tileId];
     if (!t) return { ok: false, reason: 'not_found' };
+    if (isUnassigned(t.elementId)) {
+      // 未定型的牌构造上不可点(可点 ⇒ 暴露 ≥82% ⇒ 必在感知集 ⇒ 布局器已定型);
+      // 走到这里 = 渐进定型的不变量破口——抛错,不静默拒绝
+      throw new Error(`pick: tile ${tileId} 尚未定型——未定型的牌不可点`);
+    }
     if (t.status !== 'pile' || this.derivedMap.get(tileId)?.clickable !== true) {
       return { ok: false, reason: 'not_clickable' };
     }
@@ -172,6 +179,25 @@ export class Board {
   /** 槽位紧凑化:消除后按现有顺序将 slotIndex 重排为 0..n-1 */
   compactSlots(): void {
     this.slotTiles().forEach((t, k) => { t.slotIndex = k; });
+  }
+
+  /** 渐进定型(布局器用,2026-11-27):给牌堆上一张「未定型」的牌写入类型。
+   *  牌位与类型解耦——几何不变,只改 elementId;派生态 / 可见性 / 可点性只看几何,
+   *  配对是现算的,故无需重算。
+   *  定型即冻结(「见过的牌不变样」):已定型的牌再调即抛错,与调用方无关。 */
+  assignType(tileId: number, elementId: ElementId): void {
+    const t = this.tiles[tileId];
+    if (!t) throw new Error(`assignType: tile ${tileId} 不存在`);
+    if (t.status !== 'pile') {
+      throw new Error(`assignType: tile ${tileId} 不在牌堆(${t.status}),只有牌堆上的牌能定型`);
+    }
+    if (!isUnassigned(t.elementId)) {
+      throw new Error(`assignType: tile ${tileId} 已定型(${t.elementId}),定型后不可改`);
+    }
+    if (isUnassigned(elementId)) {
+      throw new Error(`assignType: tile ${tileId} 的新类型仍是占位符(${elementId})`);
+    }
+    t.elementId = elementId;
   }
 
   // ─────────────────────────── 内部 ───────────────────────────

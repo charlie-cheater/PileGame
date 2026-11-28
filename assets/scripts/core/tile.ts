@@ -183,6 +183,24 @@ export function findPairInSlot(tray: ReadonlyArray<Tile | null>): [number, numbe
   return null;
 }
 
+// ─────────────────────────── 未定型占位(渐进定型用,2026-11-27) ───────────────────────────
+
+/** 未定型牌的占位 elementId 前缀:'~tile:' + tileId(各不相同 → 互相永不配对)。
+ *  布局器按「玩家看见才定型」填类型(assets/scripts/planner/TypeDealer.ts);
+ *  成品关卡里不允许残留——validateLevelData 的 I1(张数为单数)/ I2(不在元素表)会报错。
+ *  与 Perception 的 UNKNOWN_ELEMENT('?')是两回事:那个是「露得太少认不出」。 */
+export const UNASSIGNED_PREFIX = '~tile:';
+
+/** 生成 tileId 对应的占位 elementId */
+export function unassignedElementId(tileId: number): ElementId {
+  return UNASSIGNED_PREFIX + tileId;
+}
+
+/** elementId 是否为未定型占位符 */
+export function isUnassigned(elementId: ElementId): boolean {
+  return elementId.startsWith(UNASSIGNED_PREFIX);
+}
+
 // ─────────────────────────── 宿主关系(关卡数据,完整结构后续另行设计) ───────────────────────────
 
 export interface LevelData {

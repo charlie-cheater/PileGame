@@ -8,6 +8,8 @@
 //     见 Ladder.ts 扫描梯瀑布;expectation 即 ⑤预期的对账面,随轨迹落盘
 //
 // 每步留存感知/分析摘要(轨迹数据):后续难度感知与规划器反馈的原料。
+// 渐进定型(2026-11-27):注入 Dealer 时,循环变为 ①感知 →【布局器定型】→ 重新感知 → ②③④;
+// 不注入时与原循环逐字节一致。
 // 注意:runAgent 直接驱动 Board(会消耗牌堆)——重复实验须每次新建 Board。
 // ============================================================================
 
@@ -17,6 +19,14 @@ import { lcg } from '../core/LevelBuilder';
 import { perceive, SubjectiveView, UNKNOWN_ELEMENT } from './Perception';
 import { analyze, AnalysisResult } from './Analysis';
 import { AgentOperation, DecisionPolicy, LadderContext, OperationTrace } from './Ladder';
+
+/** 渐进定型钩子(布局器注入;2026-11-27):①感知之后、②分析之前调用。
+ *  实现在 assets/scripts/planner/TypeDealer.ts;Runner 只认这个形状,不引用 planner。
+ *  布局器属生成侧,可用全信息;它的产出只落在 Board 的类型上,代理的决策仍只读主观视图。 */
+export interface Dealer {
+  /** 为感知集里尚未定型的牌定型;返回本次定型的张数(0 = 无改动,Runner 不重新感知) */
+  assign(board: Board, view: SubjectiveView): number;
+}
 
 /** 决策策略:从主观可点集中选一张,返回 tileId */
 export type AgentPolicy = (ctx: {
@@ -60,6 +70,8 @@ export interface StepRecord {
   slotAfter: number;
   /** v2 决策轨:操作摘要(动作略去——chosenTile 即动作;legacy 路径为空) */
   operation?: OperationTrace;
+  /** 渐进定型:本步决策前定型的张数(仅注入 dealer 时记录;含开局批) */
+  dealt?: number;
 }
 
 export interface RunReport {
@@ -83,6 +95,8 @@ export interface AgentParams {
   identifyThreshold?: number;
   /** 拾取次数安全上限(缺省 = 总牌数 + 4) */
   maxPicks?: number;
+  /** 渐进定型钩子(布局器);缺省不注入,Board 的类型须事先填好 */
+  dealer?: Dealer;
 }
 
 /** 运行代理直至终局(清空 / 槽满判负 / 无可点) */
@@ -103,7 +117,10 @@ export function runAgent(board: Board, params: AgentParams = {}): RunReport {
     if (board.isCleared()) return finish('cleared');
 
     // ①感知 → ②分析(分析结果保持纯主观,不接收真值)
-    const view = perceive(board, { identifyThreshold: params.identifyThreshold });
+    let view = perceive(board, { identifyThreshold: params.identifyThreshold });
+    // 渐进定型:布局器在感知之后、分析之前给新看见的未定型牌定型;有改动则重新感知
+    const dealt = params.dealer ? params.dealer.assign(board, view) : 0;
+    if (dealt > 0) view = perceive(board, { identifyThreshold: params.identifyThreshold });
     const analysis = analyze(view);
     // 可点性对账在驱动侧做:主观 clickable 对真值(v3 等价定理,期望恒 0)
     for (const t of view.perceived) {
@@ -139,7 +156,7 @@ export function runAgent(board: Board, params: AgentParams = {}): RunReport {
     }
     maxSlotPressure = Math.max(maxSlotPressure, board.slotCount());
 
-    steps.push({
+    const record: StepRecord = {
       step: steps.length + 1,
       perceived: view.perceived.length,
       hidden: view.totalPileCount - view.perceived.length,
@@ -156,7 +173,9 @@ export function runAgent(board: Board, params: AgentParams = {}): RunReport {
             scan: operation.reason.scan, advance: operation.reason.advance,
             expectation: operation.expectation }
         : undefined,
-    });
+    };
+    if (params.dealer) record.dealt = dealt;   // 渐进定型观测:仅注入布局器时记录
+    steps.push(record);
 
     if (board.isSlotFull() && !board.findSlotPair()) return finish('slot_full');
   }

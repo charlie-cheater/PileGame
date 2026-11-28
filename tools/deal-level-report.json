@@ -1,0 +1,100 @@
+{
+ "generatedAt": "2026-11-27T10:27:17.327Z",
+ "tree": "v3check",
+ "games": 150,
+ "layout": "test_layout",
+ "tiers": {
+  "14": {
+   "build": {
+    "cleared": 124,
+    "games": 150,
+    "pressure": 2.8133333333333335,
+    "pairs": 30.606666666666666
+   },
+   "replayConsistent": 150,
+   "rules": {
+    "pair-complete": 3855,
+    "slot-close": 4591,
+    "dig": 787,
+    "explore": 53
+   },
+   "events": 22.1,
+   "opening": 40,
+   "batches": {
+    "all": {
+     "1": 2200,
+     "2": 941,
+     "3": 24,
+     "g4": 150
+    },
+    "excludingOpening": {
+     "1": 2200,
+     "2": 941,
+     "3": 24,
+     "g4": 0
+    }
+   },
+   "minMargin": {
+    "median": 0,
+    "min": 0,
+    "zeroGames": 129
+   },
+   "patternCount": {
+    "min": 1.7733333333333334,
+    "max": 9.08,
+    "unused": 0.16
+   },
+   "deadFinish": {
+    "games": 26,
+    "mean": 13.307692307692308
+   },
+   "msPerGame": 129.4521113333334
+  },
+  "23": {
+   "build": {
+    "cleared": 33,
+    "games": 150,
+    "pressure": 3.7666666666666666,
+    "pairs": 12.82
+   },
+   "replayConsistent": 150,
+   "rules": {
+    "dig": 821,
+    "pair-complete": 1325,
+    "slot-close": 1923,
+    "explore": 245
+   },
+   "events": 13.353333333333333,
+   "opening": 40,
+   "batches": {
+    "all": {
+     "1": 1152,
+     "2": 683,
+     "3": 18,
+     "g4": 150
+    },
+    "excludingOpening": {
+     "1": 1152,
+     "2": 683,
+     "3": 18,
+     "g4": 0
+    }
+   },
+   "minMargin": {
+    "median": 2,
+    "min": 0,
+    "zeroGames": 70
+   },
+   "patternCount": {
+    "min": 0.12,
+    "max": 6.826666666666667,
+    "unused": 1.8866666666666667
+   },
+   "deadFinish": {
+    "games": 117,
+    "mean": 16.478632478632477
+   },
+   "msPerGame": 57.16248800000001
+  }
+ }
+}
